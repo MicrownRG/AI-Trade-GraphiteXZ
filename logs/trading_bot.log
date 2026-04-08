@@ -1,0 +1,39 @@
+2026-04-07 17:00:58 | INFO     | core.risk.portfolio                 | Portfolio: opened t1
+2026-04-07 17:00:58 | INFO     | core.risk.portfolio                 | Portfolio: closed t1 PnL=200.00 reason=tp2 balance=10200.00
+2026-04-07 17:00:58 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: test
+2026-04-07 17:00:58 | WARNING  | core.risk.kill_switch               | 🟢 Kill switch reset by: manual
+2026-04-07 17:00:58 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Drawdown 7.00% >= limit 6.0%
+2026-04-07 17:00:58 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Consecutive loss streak: 5 trades
+2026-04-08 07:42:24 | INFO     | core.risk.portfolio                 | Portfolio: opened t1
+2026-04-08 07:42:24 | INFO     | core.risk.portfolio                 | Portfolio: closed t1 PnL=200.00 reason=tp2 balance=10200.00
+2026-04-08 07:42:24 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: unit test
+2026-04-08 07:42:24 | WARNING  | core.risk.kill_switch               | 🟢 Kill switch reset by: manual
+2026-04-08 07:42:24 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Drawdown 7.00% >= limit 6.0%
+2026-04-08 07:42:24 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Daily loss -3.00% >= limit 2.5%
+2026-04-08 07:42:24 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Consecutive loss streak: 5 trades
+2026-04-08 07:42:24 | WARNING  | data.processor                      | Removed 1 invalid OHLCV rows
+2026-04-08 07:42:24 | WARNING  | data.processor                      | Removed 1 price spikes (z>5.0)
+2026-04-08 07:44:22 | INFO     | core.risk.portfolio                 | Portfolio: opened t1
+2026-04-08 07:44:22 | INFO     | core.risk.portfolio                 | Portfolio: closed t1 PnL=200.00 reason=tp2 balance=10200.00
+2026-04-08 07:44:22 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: t
+2026-04-08 07:44:22 | WARNING  | core.risk.kill_switch               | 🟢 Kill switch reset by: manual
+2026-04-08 07:44:22 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Drawdown 7.00% >= limit 6.0%
+2026-04-08 07:44:22 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Daily loss -3.00% >= limit 2.5%
+2026-04-08 07:44:22 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Consecutive loss streak: 5 trades
+2026-04-08 07:44:22 | WARNING  | data.processor                      | Removed 1 invalid OHLCV rows
+2026-04-08 07:44:22 | WARNING  | data.processor                      | Removed 1 price spikes (z>5.0)
+2026-04-08 07:44:22 | INFO     | data.processor                      | Processing complete: 600 clean bars
+2026-04-08 07:44:22 | INFO     | data.processor                      | Processing complete: 600 clean bars
+2026-04-08 07:44:22 | INFO     | backtest.engine                     | Backtest start: 600 bars | balance=10000.00
+2026-04-08 07:44:23 | INFO     | backtest.engine                     | Backtest complete: trades=0 WR=0.0% PnL=0.00
+2026-04-08 08:04:48 | INFO     | core.risk.portfolio                 | Portfolio: opened t1
+2026-04-08 08:04:48 | INFO     | core.risk.portfolio                 | Portfolio: closed t1 PnL=200.00 reason=tp2 balance=10200.00
+2026-04-08 08:04:48 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: test
+2026-04-08 08:04:48 | WARNING  | core.risk.kill_switch               | 🟢 Kill switch reset by: manual
+2026-04-08 08:04:48 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Drawdown 7.00% >= limit 6.0%
+2026-04-08 08:04:48 | CRITICAL | core.risk.kill_switch               | 🔴 KILL SWITCH ACTIVATED: Consecutive loss streak: 5 trades
+2026-04-08 08:04:48 | WARNING  | data.processor                      | Removed 1 invalid OHLCV rows
+2026-04-08 08:04:48 | WARNING  | data.processor                      | Removed 1 price spikes (z>5.0)
+2026-04-08 08:04:48 | INFO     | data.processor                      | Processing complete: 600 clean bars
+2026-04-08 08:04:48 | INFO     | backtest.engine                     | Backtest start: 600 bars | balance=10000.00
+2026-04-08 08:04:49 | INFO     | backtest.engine                     | Backtest complete: trades=0 WR=0.0% PnL=0.00

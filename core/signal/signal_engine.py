@@ -1,0 +1,206 @@
+"""
+Signal Engine.
+
+Aggregates all structural analysis into a scored trade signal.
+Only signals with score >= MIN_SIGNAL_SCORE are forwarded to risk management.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any
+import pandas as pd
+from datetime import datetime
+
+from core.structure import (
+    calculate_htf_bias, HTFBias,
+    get_latest_sweep, LiquiditySweep,
+    get_recent_displacement, DisplacementEvent,
+    get_latest_choch, CHOCHEvent,
+    atr,
+)
+from config.trading_config import TRADING_CONFIG
+from config.risk_config import RISK_CONFIG
+from utils.logger import get_logger
+from utils.time_utils import is_valid_session
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class TradeSignal:
+    # ── Identity ──────────────────────────────────────────────────────────────
+    signal_id: str
+    symbol: str
+    timestamp: datetime
+    direction: str            # "buy" | "sell"
+
+    # ── Prices ────────────────────────────────────────────────────────────────
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    rr_ratio: float
+
+    # ── Scoring ───────────────────────────────────────────────────────────────
+    score: int
+    score_breakdown: Dict[str, int] = field(default_factory=dict)
+    max_score: int = 10
+
+    # ── Context ───────────────────────────────────────────────────────────────
+    htf_bias: Optional[HTFBias] = None
+    sweep: Optional[LiquiditySweep] = None
+    displacement: Optional[DisplacementEvent] = None
+    choch: Optional[CHOCHEvent] = None
+    atr_pips: float = 0.0
+    session: str = ""
+
+    # ── AI layer (filled later) ───────────────────────────────────────────────
+    ai_confidence: float = 0.0
+    ai_decision: str = "PENDING"
+    ai_reason: str = ""
+
+    @property
+    def is_valid(self) -> bool:
+        return (
+            self.score >= RISK_CONFIG.min_signal_score
+            and self.rr_ratio >= TRADING_CONFIG.score_weights.get("min_rr", 2.0)
+        )
+
+
+class SignalEngine:
+    def __init__(self):
+        self.weights = TRADING_CONFIG.score_weights
+
+    def generate(
+        self,
+        df_h4: pd.DataFrame,
+        df_h1: pd.DataFrame,
+        df_ltf: pd.DataFrame,   # M15 entry timeframe
+        current_time: datetime,
+        symbol: str = "XAUUSD",
+    ) -> Optional[TradeSignal]:
+        """
+        Full pipeline: structure → scoring → signal creation.
+        Returns None if no valid setup found.
+        """
+        # ── 1. HTF Bias ───────────────────────────────────────────────────────
+        htf_bias = calculate_htf_bias(df_h4, df_h1)
+        if htf_bias.direction == "neutral":
+            logger.debug("No HTF bias — skipping signal generation")
+            return None
+
+        # ── 2. Session filter ─────────────────────────────────────────────────
+        session = _get_session(current_time)
+        session_valid = session in ("London", "New York", "Overlap")
+
+        # ── 3. ATR / Volatility ───────────────────────────────────────────────
+        atr_series = atr(df_ltf, TRADING_CONFIG.atr_period)
+        current_atr = atr_series.iloc[-1] if not atr_series.empty else 0.0
+        atr_pips = current_atr / 0.1
+        volatility_ok = (
+            TRADING_CONFIG.min_atr_pips <= atr_pips <= TRADING_CONFIG.max_atr_pips
+        )
+
+        # ── 4. Liquidity sweep on LTF ─────────────────────────────────────────
+        sweep = get_latest_sweep(df_ltf)
+        sweep_valid = sweep is not None and _sweep_aligns_bias(sweep, htf_bias)
+
+        # ── 5. Displacement ───────────────────────────────────────────────────
+        displacement = get_recent_displacement(df_ltf, lookback_bars=5)
+        displacement_valid = (
+            displacement is not None
+            and _displacement_aligns_bias(displacement, htf_bias)
+        )
+
+        # ── 6. CHOCH / Structure shift ────────────────────────────────────────
+        choch = get_latest_choch(df_ltf)
+        structure_shift = choch is not None and _choch_aligns_bias(choch, htf_bias)
+
+        # ── 7. Score ──────────────────────────────────────────────────────────
+        breakdown = {
+            "htf_alignment":   self.weights["htf_alignment"]   if htf_bias.confidence >= 0.6 else 0,
+            "liquidity_sweep": self.weights["liquidity_sweep"]  if sweep_valid            else 0,
+            "displacement":    self.weights["displacement"]     if displacement_valid      else 0,
+            "session_valid":   self.weights["session_valid"]    if session_valid           else 0,
+            "volatility_ok":   self.weights["volatility_ok"]    if volatility_ok           else 0,
+            "structure_shift": self.weights["structure_shift"]  if structure_shift         else 0,
+            "choch_confirmed": self.weights["choch_confirmed"]  if choch is not None       else 0,
+        }
+        score = sum(breakdown.values())
+
+        if score < RISK_CONFIG.min_signal_score:
+            logger.debug(f"Signal score {score} below threshold {RISK_CONFIG.min_signal_score}")
+            return None
+
+        # ── 8. Entry / SL / TP calculation ───────────────────────────────────
+        direction  = "buy" if htf_bias.direction == "bullish" else "sell"
+        last_close = df_ltf["close"].iloc[-1]
+        sl_distance = max(current_atr * 1.5, 10 * 0.1)  # at least 10 pips
+
+        if direction == "buy":
+            entry = last_close
+            sl    = entry - sl_distance
+            tp    = entry + sl_distance * TRADING_CONFIG.score_weights.get("min_rr", 2.0)
+        else:
+            entry = last_close
+            sl    = entry + sl_distance
+            tp    = entry - sl_distance * TRADING_CONFIG.score_weights.get("min_rr", 2.0)
+
+        rr = abs(tp - entry) / abs(sl - entry) if abs(sl - entry) > 0 else 0
+
+        import uuid
+        signal = TradeSignal(
+            signal_id=str(uuid.uuid4())[:8],
+            symbol=symbol,
+            timestamp=current_time,
+            direction=direction,
+            entry_price=entry,
+            stop_loss=sl,
+            take_profit=tp,
+            rr_ratio=rr,
+            score=score,
+            score_breakdown=breakdown,
+            max_score=sum(self.weights.values()),
+            htf_bias=htf_bias,
+            sweep=sweep,
+            displacement=displacement,
+            choch=choch,
+            atr_pips=atr_pips,
+            session=session,
+        )
+        logger.info(f"Signal generated: {direction.upper()} score={score} RR={rr:.2f}")
+        return signal
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _sweep_aligns_bias(sweep: LiquiditySweep, bias: HTFBias) -> bool:
+    # Sell-side sweep (swept lows) → bullish continuation expected
+    # Buy-side sweep (swept highs) → bearish continuation expected
+    return (
+        (bias.direction == "bullish" and sweep.direction == "sell_side") or
+        (bias.direction == "bearish" and sweep.direction == "buy_side")
+    )
+
+
+def _displacement_aligns_bias(disp: DisplacementEvent, bias: HTFBias) -> bool:
+    return (
+        (bias.direction == "bullish" and disp.direction == "bullish") or
+        (bias.direction == "bearish" and disp.direction == "bearish")
+    )
+
+
+def _choch_aligns_bias(choch: CHOCHEvent, bias: HTFBias) -> bool:
+    return choch.direction == bias.direction
+
+
+def _get_session(dt: datetime) -> str:
+    hour = dt.hour
+    cfg  = TRADING_CONFIG
+    in_london = cfg.london_session[0] <= hour < cfg.london_session[1]
+    in_ny     = cfg.ny_session[0]     <= hour < cfg.ny_session[1]
+    if in_london and in_ny:
+        return "Overlap"
+    if in_london:
+        return "London"
+    if in_ny:
+        return "New York"
+    return "Off-Hours"
