@@ -61,11 +61,11 @@ Unlike indicator-only bots, this system replicates how institutional traders rea
 
 ### 🚀 Advanced Trading Modes
 
-- **Conservative**: 0.5% risk, high score threshold (ICT-only logic).
-- **Moderate**: 1.5% risk, balanced scoring.
-- **Aggressive**: 5% risk, lower threshold, recovery logic enabled.
-- **Very Aggressive**: 15% risk, high-frequency focus, MARTINGALE recovery, + **Pulse Scalping Engine** enabled (rapid 0.01 lot injections).
-- **Ultra Scalper**: Fast high-frequency M1 RSI/Bollinger mode. Targets small 15-pip TP ($1.50 - $5.00+), compounds safely based on equity ($500+ = +0.01 lot), and strictly throttles (Wait & Snipe) when experiencing minus daily PnL.
+- **Conservative**: 0.5% risk, high score threshold. Uses **SMC**, **Fibo**, and **Velocity Breakout**. Blocks Pulse & Reversals.
+- **Moderate**: 1.0% risk, balanced scoring. Unlocks **Reversal Engine** for exhaustion entries.
+- **Aggressive**: 2.0% risk, lower threshold. Enables **Recovery Multiplier** (1.5x lot on loss).
+- **Very Aggressive**: 3.0% risk, aggressive entry. Unlocks **Pulse Scalping Engine** for extreme M1 catching. Disables Auto Break-Even.
+- **Ultra Scalper**: 10.0% risk base. Fast high-frequency M1 action. Activates **Pulse Compound** for multi-layered extreme entries up to 3 orders. Disables recovery (no martingale) and partial-closing.
 
 ### 🛡️ Premium Anti-Liquidation
 
@@ -337,11 +337,11 @@ lot_size     = risk_amount / (sl_pips × pip_value_per_lot)
 
 ### 📈 Granular Equity Scaling (The "Measured" Path)
 
-Batas lot akumulasi dan per posisi dirinci secara granular untuk akurasi pertumbuhan modal:
+Max lot ceilings per entry and cumulative totals are scaled granularly based on account equity:
 
-| Saldo (Equity)     | Plafon Total (Kumulatif) | **Max Lot Per Entry** |
-| :----------------- | :----------------------- | :-------------------- |
-| **<$300**          | 0.02 Lot                 | **0.01 Lot**          |
+| Equity Balance     | Total Ceiling (Cumulative) | **Max Lot Per Entry** |
+| :----------------- | :------------------------- | :-------------------- |
+| **<$300**          | 0.02 Lot                   | **0.01 Lot**          |
 | **$301 - $500**    | 0.03 Lot                 | **0.01 Lot**          |
 | **$501 - $1000**   | **0.04 Lot**             | **0.01 Lot**          |
 | **$1001 - $1500**  | **0.06 Lot**             | **0.02 Lot**          |
@@ -355,12 +355,12 @@ Batas lot akumulasi dan per posisi dirinci secara granular untuk akurasi pertumb
 
 ### 🛡️ Anti-Revenge & Stability Logic
 
-Bot dilengkapi dengan kontrol stabilitas untuk mencegah "revenge trading" dan _over-exposure_:
+The bot embraces stability guardrails to prevent "revenge trading" and _over-exposure_:
 
-- **Cooldown Setelah Loss**: Jeda **15 menit** setelah posisi loss untuk menenangkan market.
-- **Entry Delay Jeda**: Jeda **120 detik (2 menit)** antar entry untuk stabilitas sinyal.
-- **Profit-Lock**: Baru menambah posisi (multi-entry) jika posisi sebelumnya sedang **PROFIT**.
-- **Max Consecutive Loss**: Berhenti (Pause) 2 jam otomatis jika loss 3x berturut-turut.
+- **Post-Loss Cooldown**: **15-minute** cool-off period after a losing position to let market volatility settle.
+- **Entry Delay**: **120-second (2 mins)** delay between entries for signal stability.
+- **Profit-Lock**: Multi-entry scaling is strictly gated; subsequent positions are only added if the previous one is **IN PROFIT**.
+- **Max Consecutive Loss**: Auto-pauses trading for 2 hours if 3 consecutive losses hit to protect drawn-down margins.
 
 ### Stop Loss Placement
 
@@ -559,7 +559,7 @@ trading_bot/
 | ----------------- | ---------- | --------------------------------- |
 | Python            | 3.11+      | 3.12 recommended                  |
 | PostgreSQL        | 14+        | Or use Docker Compose             |
-| MetaTrader 5      | Latest     | **Windows only** for live trading |
+| MetaTrader 5      | Latest     | Windows or Linux (via Wine/`mt5linux`) |
 | ICMarkets Account | Raw Spread | For live execution                |
 
 ### Step 1 — Clone the repository
@@ -587,7 +587,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> **Note for MetaTrader5**: The `MetaTrader5` package is Windows-only. On Linux/macOS it will be skipped automatically (backtesting still works fully).
+> **Note for MetaTrader5**: The native `MetaTrader5` package is Windows-native. For Linux/VPS deployment, you must install MetaTrader 5 via Wine and utilize the `mt5linux` bridge package for live execution. Backtesting works fully on macOS/Linux without MT5.
 
 ### Step 4 — Set up environment variables
 
@@ -724,52 +724,15 @@ The system accepts **CSV** or **Parquet** files with the following structure:
 
 ### Minimum data requirements
 
-| Timeframe | Minimum bars | Recommended | Covers               |
-| --------- | ------------ | ----------- | -------------------- |
-| M15       | 2,000        | 10,000+     | ~1 month / ~6 months |
-| M5        | 5,000        | 20,000+     | ~2 weeks / ~2 months |
-| H1        | 500          | 2,000       | ~3 weeks / ~3 months |
-| H4        | 200          | 500         | ~5 weeks / ~12 weeks |
+Since the bot fetches historical data dynamically via the MetaTrader 5 bridge, no manual CSV downloads are required. Ensure your MT5 terminal has sufficient historical data loaded before initiating a backtest.
 
-> For **meaningful backtest results** with 1,000+ trades: provide at least **12 months of M15 data** (~35,000 bars).
+| Timeframe | Recommended | Covers               |
+| --------- | ----------- | -------------------- |
+| M15       | 10,000+     | ~6 months            |
+| M5        | 20,000+     | ~2 months            |
+| H1        | 2,000       | ~3 months            |
 
-### Where to get historical data
-
-**Option 1 — Export directly from MetaTrader 5:**
-
-1. Open MT5 → History Center (`Tools > History Center`)
-2. Select `XAUUSD` → `M15`
-3. Click `Download` → Export as CSV
-4. Place in `data/XAUUSD_M15.csv`
-
-**Option 2 — Python via MT5 API:**
-
-```python
-from execution.mt5_client import MT5Client
-from data.fetcher import fetch_from_mt5
-import pandas as pd
-
-mt5 = MT5Client()
-mt5.connect()
-df = fetch_from_mt5(mt5, "XAUUSD", "M15", count=50000)
-df.to_csv("data/XAUUSD_M15.csv")
-```
-
-**Option 3 — Third-party sources:**
-
-- [TrueFX](https://www.truefx.com/) — free tick data
-- [Dukascopy](https://www.dukascopy.com/swiss/english/marketwatch/historical/) — free OHLCV
-- [HistData](https://www.histdata.com/) — free Forex/Gold historical data
-
-### CSV naming convention
-
-```
-data/
-├── XAUUSD_M5.csv       # 5-minute bars
-├── XAUUSD_M15.csv      # 15-minute bars (primary)
-├── XAUUSD_H1.csv       # 1-hour bars
-└── XAUUSD_H4.csv       # 4-hour bars
-```
+> For **meaningful backtest results** the built-in loader automatically attempts to pull up to 10,000 recent candles for rigorous evaluation.
 
 ---
 
@@ -777,23 +740,19 @@ data/
 
 ### Backtest Mode
 
-````bash
-# Basic backtest with M15 data
-python main.py --mode backtest --data data/XAUUSD_M15.csv
+You can run a rigorous backtest simulation using data directly streamed from your MT5 demo account without requiring manual CSVs.
 
-# Custom starting balance
-python main.py --mode backtest --data data/XAUUSD_M15.csv --balance 50000
+```bash
+# Basic backtest using MT5 live historical data
+python main.py --mode backtest --mt5
+
+# Run a custom strategy with custom balance
+python main.py --mode backtest --mt5 --strategy all --balance 50000
 
 # Results saved to:
 #   results/trades_YYYYMMDD_HHMMSS.csv
 #   results/equity_YYYYMMDD_HHMMSS.csv
-
-### Backtest with Live MT5 Data
-You can also run a backtest using the latest 500 bars directly from your MT5 demo account (no CSV required):
-
-```bash
-python main.py --mode backtest --mt5
-````
+```
 
 ````
 
@@ -808,8 +767,21 @@ python main.py --mode paper
 ### Live Trading Mode
 
 ```bash
-# Requires Windows + MT5 installed + credentials in .env
-python main.py --mode live
+# Basic run with all available strategies for current mode natively enabled
+python main.py --mode live --strategy all
+
+# Run specific strategy combinations manually:
+python main.py --mode live --strategy smc            # Pure SMC Logic Mode
+python main.py --mode live --strategy pulse,fibo     # Pulse Scalper + Fibonacci
+python main.py --mode live --strategy rev,velo       # Reversal + Velocity Breakout
+
+# Available Strategy Engine Codes:
+#  smc   : ICT/SMC Advanced Logic
+#  fibo  : Fibonacci MTF Tiered
+#  rev   : Reversal / MACD Spike (Exhausted/Spike Bounce)
+#  pulse : Pulse Scalper (M1 Extreme Momentum)
+#  velo  : Velocity Breakout Engine
+#  all   : Default. Enables all the strategies listed above.
 ```
 
 ### Docker (Full Stack)
@@ -822,7 +794,7 @@ docker-compose up -d
 docker-compose logs -f trading_bot
 
 # Run backtest inside Docker
-docker-compose run trading_bot python main.py --mode backtest --data data/XAUUSD_M15.csv
+docker-compose run trading_bot python main.py --mode backtest
 
 # Stop everything
 docker-compose down
@@ -848,7 +820,7 @@ AI_PROVIDER=gemini python main.py --mode live
 ### Running a backtest
 
 ```bash
-python main.py --mode backtest --data data/XAUUSD_M15.csv --balance 10000
+python main.py --mode backtest --mt5 --balance 10000
 ```
 
 ### Sample output
@@ -1005,7 +977,7 @@ Snapshot saved every cycle: balance, equity, drawdown, daily P&L, win rate.
 
 ### `ModuleNotFoundError: No module named 'MetaTrader5'`
 
-MT5 is Windows-only. On Linux/macOS, use backtest or paper mode:
+MT5 is native to Windows. On Linux, you MUST use the `mt5linux` package alongside MT5 installed via Wine for live execution. On macOS, use backtest or paper mode:
 
 ```bash
 python main.py --mode backtest --data data/XAUUSD_M15.csv

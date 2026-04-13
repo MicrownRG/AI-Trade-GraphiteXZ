@@ -72,8 +72,10 @@ class BacktestEngine:
         self,
         initial_balance: float = 10_000.0,
         use_ai: bool = False,
+        allowed_strategies: list[str] = None,
     ):
         self.initial_balance = initial_balance
+        self.allowed_strategies = allowed_strategies or ["all"]
         self.portfolio       = Portfolio(initial_balance)
         self.signal_engine   = SignalEngine()
         self.risk_executor   = RiskExecutor(self.portfolio)
@@ -162,7 +164,9 @@ class BacktestEngine:
 
             order = self.risk_executor.evaluate(
                 signal=signal,
-                df_ltf=window_ltf,
+                df_m15=window_ltf,
+                df_m5=window_ltf,
+                df_m1=window_ltf,
                 swings=swings,
                 spread_pips=spread,
                 current_time=bar_time.to_pydatetime(),

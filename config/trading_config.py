@@ -58,7 +58,7 @@ class TradingConfig:
 
     # ── ATR-based filters ─────────────────────────────────────────────────────
     atr_period: int = 14
-    min_atr_pips: float = 8.0      # avoid dead market
+    min_atr_pips: float = 6.0      # lowered from 8.0 to allow Asian session entries
     max_atr_pips: float = 120.0    # avoid extreme volatility (news)
 
     # ── News / event blackout (minutes before/after) ──────────────────────────

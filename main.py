@@ -20,16 +20,26 @@ logger = get_logger("main")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def run_backtest(data_path: str, initial_balance: float = 10_000.0) -> None:
-    from data.fetcher import fetch_from_file
+def run_backtest(data_path: str, initial_balance: float = 10_000.0, allowed_strategies: list[str] = None, use_mt5: bool = False) -> None:
+    if allowed_strategies is None:
+        allowed_strategies = ["all"]
+    from data.fetcher import fetch_from_file, fetch_from_mt5
     from backtest.engine import BacktestEngine
     from backtest.metrics import print_report, trade_log_to_df, equity_curve_to_df
 
-    logger.info(f"🔄 Loading data: {data_path}")
-    df = fetch_from_file(data_path, timeframe_label="M15")
+    if use_mt5:
+        logger.info(f"🔄 Fetching latest 10,000 bars from MT5 logic (M15)")
+        from execution.mt5_client import MT5Client
+        mt5_tmp = MT5Client()
+        mt5_tmp.connect()
+        df = fetch_from_mt5(mt5_tmp, "XAUUSD", "M15", count=10000)
+        mt5_tmp.disconnect()
+    else:
+        logger.info(f"🔄 Loading data: {data_path}")
+        df = fetch_from_file(data_path, timeframe_label="M15")
 
-    logger.info(f"🚀 Starting backtest: {len(df)} bars | balance=${initial_balance:,.2f}")
-    engine = BacktestEngine(initial_balance=initial_balance, use_ai=False)
+    logger.info(f"🚀 Starting backtest: {len(df)} bars | balance=${initial_balance:,.2f} | strategies={allowed_strategies}")
+    engine = BacktestEngine(initial_balance=initial_balance, use_ai=False, allowed_strategies=allowed_strategies)
     result = engine.run(df_ltf=df, warm_up_bars=100)
 
     print_report(result)
@@ -596,8 +606,7 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
 def main():
     parser = argparse.ArgumentParser(description="AI XAUUSD Trading System")
     parser.add_argument("--mode",    default=RUN_MODE, choices=["backtest", "live", "paper"])
-    parser.add_argument("--data",    default="data/XAUUSD_M15.csv")
-    parser.add_argument("--mt5", action="store_true")
+    parser.add_argument("--mt5", action="store_true", help="Fetch history directly from MT5 (default for backtest)")
     parser.add_argument("--balance", type=float, default=10_000.0)
     parser.add_argument("--strategy", type=str, default="all", help="Comma-separated list of strategies to run: smc,fibo,rev,pulse. Default 'all'.")
     args = parser.parse_args()
@@ -609,7 +618,7 @@ def main():
     elif args.mode == "paper":
         run_live(paper=True, allowed_strategies=allowed_strats)
     else:
-        run_backtest(args.data, args.balance)
+        run_backtest(data_path=None, initial_balance=args.balance, allowed_strategies=allowed_strats, use_mt5=True)
 
 if __name__ == "__main__":
     main()
