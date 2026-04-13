@@ -8,8 +8,9 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config.settings import SYMBOL
 from utils.logger import get_logger
@@ -40,6 +41,36 @@ def fetch_from_mt5(
 
     logger.debug(f"Fetched {len(df)} bars: {symbol} {timeframe}")
     return df
+
+
+def fetch_batch_mt5(
+    mt5_client,
+    timeframes: List[str],
+    symbol: str = SYMBOL,
+    count: int = 500,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch multiple timeframes in parallel using ThreadPoolExecutor.
+    Returns a dictionary mapping timeframe name to its DataFrame.
+    """
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(len(timeframes), 10)) as executor:
+        # Create a mapping of future to TF string
+        future_to_tf = {
+            executor.submit(fetch_from_mt5, mt5_client, symbol, tf, count): tf
+            for tf in timeframes
+        }
+        
+        for future in as_completed(future_to_tf):
+            tf = future_to_tf[future]
+            try:
+                df = future.result()
+                if not df.empty:
+                    results[tf.lower()] = df
+            except Exception as e:
+                logger.error(f"Parallel fetch failed for {tf}: {e}")
+                
+    return results
 
 
 def fetch_from_file(

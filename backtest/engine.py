@@ -15,7 +15,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 
@@ -23,7 +23,7 @@ from core.structure.swing import detect_swings
 from core.signal.signal_engine import SignalEngine
 from core.risk.executor import RiskExecutor, TradeOrder
 from core.risk.portfolio import Portfolio, ClosedTrade
-from core.risk.kill_switch import kill_switch
+
 from core.risk.take_profit import trailing_stop
 from ai.scorer import AIScorer
 from data.feature_engineering import prepare_backtest_data
@@ -118,11 +118,6 @@ class BacktestEngine:
                 self.trades_today = 0
                 self.portfolio.record_day_start()
                 self._last_date = bar_time.date()
-
-            # ── Kill switch check ─────────────────────────────────────────────
-            if not kill_switch.check_all(self.portfolio.drawdown_pct, self.portfolio.daily_pnl_pct):
-                logger.warning(f"Kill switch at bar {i}: {kill_switch.reason}")
-                break
 
             # ── Manage open positions ─────────────────────────────────────────
             self._manage_positions(bar, bar_time)
@@ -229,7 +224,6 @@ class BacktestEngine:
                 exit_p = pos.stop_loss
                 pnl    = self._calc_pnl(pos.direction, pos.entry_price, exit_p, pos.lot_size)
                 self._close_position(tid, pos, exit_p, pnl, "sl")
-                kill_switch.record_trade_result(pnl)
                 continue
 
             # TP hit
@@ -239,7 +233,6 @@ class BacktestEngine:
                 exit_p = pos.take_profit
                 pnl    = self._calc_pnl(pos.direction, pos.entry_price, exit_p, pos.lot_size)
                 self._close_position(tid, pos, exit_p, pnl, "tp2")
-                kill_switch.record_trade_result(pnl)
                 continue
 
             # Trailing stop update
@@ -262,7 +255,7 @@ class BacktestEngine:
             pnl=pnl,
             pnl_pips=pnl / (pos.lot_size * 10.0) if pos.lot_size > 0 else 0,
             opened_at=pos.opened_at,
-            closed_at=datetime.utcnow(),
+            closed_at=datetime.now(timezone.utc),
             reason=reason,
         )
         self.portfolio.close_trade(ct)

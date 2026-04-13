@@ -11,7 +11,7 @@ class AIConfig:
     max_retries: int = 3
     retry_delay_seconds: float = 2.0
     # Confidence gate — trades below this are skipped
-    confidence_threshold: float = 0.60
+    confidence_threshold: float = 0.50
     # Disable AI in backtest to save API calls; use rule-based scoring only
     enabled_in_backtest: bool = False
 

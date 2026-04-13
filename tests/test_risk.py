@@ -12,7 +12,7 @@ from core.risk.filters import (
     filter_spread, filter_session, filter_daily_loss,
     filter_daily_trade_count, filter_rr_ratio, run_all_filters,
 )
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 # ── Lot sizing ────────────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ class TestPortfolio:
             trade_id="t1", symbol="XAUUSD", direction="buy",
             entry_price=1950.0, exit_price=1970.0, lot_size=0.1,
             pnl=200.0, pnl_pips=200.0,
-            opened_at=datetime.utcnow(), closed_at=datetime.utcnow(),
+            opened_at=datetime.now(timezone.utc), closed_at=datetime.now(timezone.utc),
             reason="tp2",
         )
         pf.close_trade(ct)

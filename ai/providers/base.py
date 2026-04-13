@@ -83,3 +83,14 @@ class BaseAIProvider(ABC):
         # Clamp confidence to [0, 1]
         result["confidence"] = max(0.0, min(1.0, float(result["confidence"])))
         return result
+
+    def safe_call_raw(self, system: str, user: str) -> Optional[dict]:
+        """
+        Wraps call() but bypasses strict signal validation.
+        Use this for general purpose AI queries like EOD analysis.
+        Returns parsed JSON dict, or None if malformed API text.
+        """
+        result = self.call(system, user)
+        if result is None:
+            return None
+        return result

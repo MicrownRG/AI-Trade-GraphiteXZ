@@ -38,7 +38,7 @@ class AIScorer:
         If AI is disabled (backtest mode), uses rule-based fallback.
         """
         if not self.enabled:
-            return self._rule_based(signal)
+            return self._rule_based_pass(signal)
 
         prompt  = build_evaluation_prompt(signal)
         result  = call_ai(system=SYSTEM_PROMPT, user=prompt)
@@ -72,9 +72,26 @@ class AIScorer:
         return eval_
 
     @staticmethod
+    def _rule_based_pass(signal: TradeSignal) -> AIEvaluation:
+        """
+        When USE_AI=false: always TAKE if signal passed engine scoring.
+        The signal engine threshold is the single gate — no double-filtering.
+        """
+        score    = signal.score
+        max_score = signal.max_score or 10
+        conf     = round(min(1.0, score / max_score), 3)
+        return AIEvaluation(
+            confidence = conf,
+            decision   = "TAKE",
+            reason     = f"AI disabled — auto-TAKE (score={score}/{max_score})",
+            source     = "rule_based",
+            provider   = "rule_based",
+        )
+
+    @staticmethod
     def _rule_based(signal: TradeSignal) -> AIEvaluation:
         """
-        Deterministic fallback scorer — used in backtesting or when API unavailable.
+        Deterministic fallback scorer — used when API call fails.
         """
         score     = signal.score
         max_score = signal.max_score or 10
@@ -83,7 +100,7 @@ class AIScorer:
         if signal.sweep and signal.displacement:
             raw_conf = min(1.0, raw_conf + 0.10)
 
-        if signal.session not in ("London", "New York", "Overlap"):
+        if signal.session not in ("London", "New York", "Overlap", "Asian"):
             raw_conf *= 0.70
 
         if signal.htf_bias and signal.htf_bias.confidence >= 0.80:

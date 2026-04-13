@@ -28,10 +28,15 @@ DB_URL = os.getenv(
 )
 DB_ECHO = os.getenv("DB_ECHO", "false").lower() == "true"
 
-# ─── Anthropic AI ─────────────────────────────────────────────────────────────
+# ─── AI Settings ─────────────────────────────────────────────────────────────
+USE_AI            = os.getenv("USE_AI", "true").lower() == "true"
+AI_PROVIDER       = os.getenv("AI_PROVIDER", "deepseek").lower()
+DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-AI_MODEL          = "claude-opus-4-5"
-AI_MAX_TOKENS     = 512
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
+AI_MODEL          = os.getenv("AI_MODEL", "deepseek-chat")
+AI_MAX_TOKENS     = int(os.getenv("AI_MAX_TOKENS", "512"))
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -39,4 +44,5 @@ LOG_DIR   = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 # ─── Mode ─────────────────────────────────────────────────────────────────────
-RUN_MODE = os.getenv("RUN_MODE", "backtest")   # "backtest" | "live" | "paper"
+RUN_MODE           = os.getenv("RUN_MODE", "backtest")   # "backtest" | "live" | "paper"
+DEFAULT_TRADE_MODE = os.getenv("DEFAULT_TRADE_MODE", "VERY_AGGRESSIVE")

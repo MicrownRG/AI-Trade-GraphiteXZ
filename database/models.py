@@ -3,7 +3,7 @@ Database models using SQLAlchemy 2.x declarative style.
 """
 from __future__ import annotations
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import (
     String, Float, Integer, Boolean, DateTime, Text, JSON,
     ForeignKey,
@@ -41,7 +41,7 @@ class SignalModel(Base):
     ai_confidence: Mapped[float | None]
     ai_decision: Mapped[str | None] = mapped_column(String(10))
     ai_reason: Mapped[str | None]   = mapped_column(Text)
-    created_at: Mapped[datetime]    = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime]    = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     trade: Mapped["TradeModel | None"] = relationship("TradeModel", back_populates="signal")
 
@@ -52,6 +52,7 @@ class TradeModel(Base):
     id: Mapped[str]           = mapped_column(String(36), primary_key=True, default=_uuid)
     trade_id: Mapped[str]     = mapped_column(String(20), unique=True, index=True)
     signal_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("signals.id"))
+    account_id: Mapped[str | None] = mapped_column(String(20), index=True)
     mt5_ticket: Mapped[int | None]
     symbol: Mapped[str]       = mapped_column(String(10))
     direction: Mapped[str]    = mapped_column(String(4))
@@ -77,6 +78,7 @@ class PerformanceMetrics(Base):
 
     id: Mapped[str]            = mapped_column(String(36), primary_key=True, default=_uuid)
     date: Mapped[datetime]     = mapped_column(DateTime, index=True)
+    account_id: Mapped[str | None] = mapped_column(String(20), index=True)
     balance: Mapped[float]
     equity: Mapped[float]
     drawdown_pct: Mapped[float]
@@ -84,4 +86,4 @@ class PerformanceMetrics(Base):
     daily_trades: Mapped[int]
     win_rate: Mapped[float]
     total_trades: Mapped[int]
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))

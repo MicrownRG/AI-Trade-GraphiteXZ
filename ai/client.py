@@ -36,6 +36,15 @@ def call_ai(system: str, user: str) -> Optional[dict]:
     logger.debug(f"call_ai -> provider={get_active_provider_name()}")
     return provider.safe_call(system, user)
 
+def call_ai_raw(system: str, user: str) -> Optional[dict]:
+    """
+    Call the active AI provider without signal JSON validation.
+    Returns the parsed JSON dictionary. Used for EOD queries.
+    """
+    provider = get_provider()
+    logger.debug(f"call_ai_raw -> provider={get_active_provider_name()}")
+    return provider.safe_call_raw(system, user)
+
 
 # Backwards-compatible alias — scorer.py still imports call_claude
 call_claude = call_ai

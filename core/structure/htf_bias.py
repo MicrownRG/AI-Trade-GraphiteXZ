@@ -76,6 +76,14 @@ def calculate_htf_bias(df_h4: pd.DataFrame, df_h1: pd.DataFrame) -> HTFBias:
         direction   = "bearish"
         confidence  = 0.45
         trend_str   = "Weak bearish: H4 CHOCH only (early reversal signal)"
+    elif h1_dir == "bullish":
+        direction   = "bullish"
+        confidence  = 0.50
+        trend_str   = "Mild bullish: H1 BOS only (H4 neutral)"
+    elif h1_dir == "bearish":
+        direction   = "bearish"
+        confidence  = 0.50
+        trend_str   = "Mild bearish: H1 BOS only (H4 neutral)"
     else:
         direction  = "neutral"
         confidence = 0.30

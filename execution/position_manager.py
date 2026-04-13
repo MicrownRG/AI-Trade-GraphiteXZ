@@ -6,7 +6,7 @@ Used on startup to re-hydrate state after a crash or restart.
 """
 from __future__ import annotations
 from typing import List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 
 from execution.mt5_client import MT5Client
 from core.risk.portfolio import Portfolio
@@ -33,9 +33,9 @@ class PositionManager:
         with database records to restore portfolio state.
         """
         mt5_positions = self.mt5.get_open_positions()
-        db_trades     = self.repo.get_open_trades()
+        db_trades     = self.repo.get_open_trades()  # returns list of dicts
 
-        db_tickets = {t.mt5_ticket for t in db_trades if t.mt5_ticket}
+        db_tickets  = {t["mt5_ticket"] for t in db_trades if t.get("mt5_ticket")}
         mt5_tickets = {p["ticket"] for p in mt5_positions}
 
         # Positions in MT5 but NOT in DB → orphaned, log a warning
@@ -46,32 +46,53 @@ class PositionManager:
         # Positions in DB as open but NOT in MT5 → closed externally
         externally_closed = db_tickets - mt5_tickets
         for ticket in externally_closed:
-            trade = next((t for t in db_trades if t.mt5_ticket == ticket), None)
+            trade = next((t for t in db_trades if t.get("mt5_ticket") == ticket), None)
             if trade:
                 logger.warning(
-                    f"Trade {trade.trade_id} closed externally (ticket #{ticket})"
+                    f"Trade {trade['trade_id']} closed externally (ticket #{ticket})"
                 )
-                # Mark as closed in DB with unknown exit
                 from core.risk.portfolio import ClosedTrade
                 ct = ClosedTrade(
-                    trade_id   = trade.trade_id,
-                    symbol     = trade.symbol,
-                    direction  = trade.direction,
-                    entry_price= trade.entry_price,
-                    exit_price = trade.entry_price,  # unknown
-                    lot_size   = trade.lot_size,
+                    trade_id   = trade["trade_id"],
+                    symbol     = trade["symbol"],
+                    direction  = trade["direction"],
+                    entry_price= trade["entry_price"],
+                    exit_price = trade["entry_price"],  # unknown
+                    lot_size   = trade["lot_size"],
                     pnl        = 0.0,
                     pnl_pips   = 0.0,
-                    opened_at  = trade.opened_at,
-                    closed_at  = datetime.utcnow(),
+                    opened_at  = trade["opened_at"],
+                    closed_at  = datetime.now(timezone.utc),
                     reason     = "external_close",
                 )
                 self.portfolio.close_trade(ct)
                 self.repo.save_trade_close(ct)
 
-        # Re-register remaining open positions
+        # Re-register remaining open positions (ONLY if they belong to the bot)
+        BOT_MAGIC = 20240101
+        restored_count = 0
+        
         for pos in mt5_positions:
-            trade_id = f"restored_{pos['ticket']}"
+            # Check if trade belongs to this bot (via magic number or specialized comment)
+            is_bot_trade = (pos.get("magic") == BOT_MAGIC) or (str(pos.get("comment", "")).startswith("sig:"))
+            
+            if not is_bot_trade:
+                logger.info(f"Ignoring manual/orphaned position #{pos['ticket']} (Symbol: {pos['symbol']})")
+                continue
+
+            ticket = pos["ticket"]
+            
+            # Prevent duplication if portfolio.json already loaded this ticket
+            already_tracked = any(t.get("mt5_ticket") == ticket for t in self.portfolio.open_trades.values())
+            if already_tracked:
+                continue
+
+            trade_id = f"restored_{ticket}"
+            
+            # Safe SL/TP conversion: 0.0 means 'not set' in MT5
+            sl_val = pos["sl"] if pos["sl"] > 0 else None
+            tp_val = pos["tp"] if pos["tp"] > 0 else None
+            
             self.portfolio.open_trade(trade_id, {
                 "mt5_ticket":  pos["ticket"],
                 "signal_id":   "restored",
@@ -79,18 +100,20 @@ class PositionManager:
                 "direction":   pos["direction"],
                 "entry_price": pos["open_price"],
                 "lot_size":    pos["volume"],
-                "stop_loss":   pos["sl"],
-                "take_profit": pos["tp"],
+                "stop_loss":   sl_val,
+                "take_profit": tp_val,
                 "tp_levels":   None,
-                "opened_at":   datetime.utcnow(),
+                "be_activated": False,
+                "opened_at":   datetime.now(timezone.utc),
             })
+            restored_count += 1
 
         logger.info(
-            f"Position sync: {len(mt5_positions)} MT5 positions restored "
+            f"Position sync: {restored_count} MT5 positions restored "
             f"| {len(externally_closed)} externally closed reconciled"
         )
 
-    def close_all_positions(self, reason: str = "kill_switch") -> int:
+    def close_all_positions(self, reason: str = "manual_cutloss") -> int:
         """Emergency: close all open positions. Returns number closed."""
         positions = self.mt5.get_open_positions()
         closed = 0

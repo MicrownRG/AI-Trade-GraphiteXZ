@@ -31,11 +31,12 @@ from telegram.commands    import CommandHandler
 from telegram.pause_manager import pause_manager, BotState
 from telegram.formatter   import (
     fmt_trade_entry, fmt_trade_tp, fmt_trade_sl,
-    fmt_trade_breakeven, fmt_kill_switch_triggered,
+    fmt_trade_breakeven,
     fmt_bot_paused, fmt_loss_alert, fmt_daily_summary,
+    fmt_risk_rejection, fmt_ai_rejection, fmt_trend_alert,
 )
 from core.risk.portfolio  import Portfolio, ClosedTrade
-from core.risk.kill_switch import kill_switch
+
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -47,13 +48,17 @@ class TelegramBot:
         portfolio:            Portfolio,
         db_repo               = None,
         trades_today_ref:     Optional[Callable[[], int]] = None,
+        multi_tf              = None,
 
         # Loss guard settings
         loss_pause_minutes:       int   = 60,
         consecutive_loss_trigger: int   = 3,
-        daily_loss_pct_trigger:   float = 2.0,
+        daily_loss_pct_trigger:   float = float(os.getenv("DAILY_LOSS_PCT_TRIGGER", "3.0")),
+        global_drawdown_pct_trigger: float = float(os.getenv("GLOBAL_DRAWDOWN_PCT_TRIGGER", "20.0")),
+        risk_pct_default:         float = float(os.getenv("RISK_PCT_DEFAULT", "1.0")),
     ):
         self.portfolio   = portfolio
+        self.multi_tf    = multi_tf
         self.notifier    = TelegramNotifier()
         self.cmd_handler = CommandHandler(
             notifier         = self.notifier,
@@ -61,40 +66,71 @@ class TelegramBot:
             db_repo          = db_repo,
             trades_today_ref = trades_today_ref or (lambda: 0),
         )
+        self.cmd_handler.bot_ref = self # Allow cmd_handler to update settings
+
+        # Per-user alert preferences (default OFF)
+        # {chat_id: bool} where True = Full (with AI/Risk), False = Basic
+        self.user_prefs: dict[str, bool] = {}
 
         # Loss guard
         self._loss_pause_minutes       = loss_pause_minutes
         self._consecutive_loss_trigger = consecutive_loss_trigger
         self._daily_loss_pct_trigger   = daily_loss_pct_trigger
+        self._global_drawdown_pct_trigger = global_drawdown_pct_trigger
+        self._risk_pct_default         = risk_pct_default
         self._consecutive_losses       = 0
 
-        # Wire kill switch → auto-notify + halt
-        kill_switch_original = kill_switch.trigger
-        def _patched_trigger(reason: str):
-            kill_switch_original(reason)
-            pause_manager.halt(reason)
-            self.notifier.send(fmt_kill_switch_triggered(
-                reason=reason,
-                triggered_at=datetime.now(timezone.utc),
-            ))
-        kill_switch.trigger = _patched_trigger  # type: ignore
+        # Trend notification (per-user opt-in, default from .env)
+        self._trend_notify_default = os.getenv("TREND_NOTIFY_ENABLED", "false").lower() == "true"
+        self.trend_notify_users: dict[str, bool] = {}  # {chat_id: True/False}
+        self._last_known_bias: Optional[str] = None
+        
+        # Stalking / Pantau Cooldowns: {setup_id: last_notified_time}
+        # setup_id = direction (e.g., "buy" or "sell"). 
+        # We only notify for the primary setups to avoid spam.
+        self._stalking_cooldowns: dict[str, datetime] = {}
+
+    def get_current_risk_pct(self) -> float:
+        """Adaptive risk %: reduced after consecutive losses.
+          * 0-1 losses: full base risk
+          * 2 losses:   75% of base
+          * 3+ losses:  50% of base
+        """
+        base = self._risk_pct_default
+        if self._consecutive_losses >= 3:
+            return base * 0.5
+        if self._consecutive_losses >= 2:
+            return base * 0.75
+        return base
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
         """Start command polling thread and send startup notification."""
         self.cmd_handler.start()
-        self.notifier.send_blocking(
+        
+        # Format metrics
+        pf = self.portfolio
+        msg = (
             f"🤖 *Trading Bot Started*\n"
-            f"Balance: `${self.portfolio.balance:,.2f}`\n"
+            f"{chr(8212) * 15}\n"
+            f"🏦 Balance:   `${pf.balance:,.2f}`\n"
+            f"📊 Equity:    `${pf.equity:,.2f}`\n"
+            f"📉 Drawdown:  `{pf.drawdown_pct:.2f}%`\n"
+            f"🌊 Floating:  `${pf.current_floating_pnl:,.2f}`\n"
+            f"📅 Today PnL: `${pf.daily_pnl:,.2f}`\n\n"
             f"Mode: LIVE\n"
             f"Send /help for commands\\."
         )
+        self.notifier.send_blocking(msg)
         logger.info("TelegramBot started")
 
     def stop(self) -> None:
         self.cmd_handler.stop()
-        self.notifier.send_blocking("⏹ *Trading Bot Stopped*")
+        try:
+            self.notifier.send_blocking("⏹ *Trading Bot Stopped*")
+        except:
+            pass
         logger.info("TelegramBot stopped")
 
     # ── Trading gate ──────────────────────────────────────────────────────────
@@ -121,22 +157,60 @@ class TelegramBot:
         ai_confidence:float,
         ai_reason:    str,
         opened_at:    Optional[datetime] = None,
+        strategy:     str = "",
     ) -> None:
-        self.notifier.send(fmt_trade_entry(
-            trade_id     = trade_id,
-            direction    = direction,
-            entry_price  = entry_price,
-            stop_loss    = stop_loss,
-            take_profit  = take_profit,
-            lot_size     = lot_size,
-            risk_amount  = risk_amount,
-            risk_pct     = risk_pct,
-            signal_score = signal_score,
-            session      = session,
-            ai_confidence= ai_confidence,
-            ai_reason    = ai_reason,
-            opened_at    = opened_at or datetime.now(timezone.utc),
-        ))
+        # Loop over all allowed users to send tailored message
+        for chat_id in self.cmd_handler.allowed:
+            prefers_full = self.user_prefs.get(chat_id, False)
+            
+            self.notifier.send(
+                fmt_trade_entry(
+                    trade_id     = trade_id,
+                    direction    = direction,
+                    entry_price  = entry_price,
+                    stop_loss    = stop_loss,
+                    take_profit  = take_profit,
+                    lot_size     = lot_size,
+                    risk_amount  = risk_amount,
+                    risk_pct     = risk_pct,
+                    signal_score = signal_score,
+                    session      = session,
+                    ai_confidence= ai_confidence if prefers_full else None,
+                    ai_reason    = ai_reason if prefers_full else None,
+                    opened_at    = opened_at or datetime.now(timezone.utc),
+                    strategy     = strategy,
+                ),
+                chat_id = chat_id
+            )
+
+    def notify_risk_rejection(
+        self,
+        symbol: str,
+        direction: str,
+        reason: str,
+        signal_id: str,
+    ) -> None:
+        for chat_id in self.cmd_handler.allowed:
+            if self.user_prefs.get(chat_id, False):
+                self.notifier.send(
+                    fmt_risk_rejection(symbol, direction, reason, signal_id),
+                    chat_id = chat_id
+                )
+
+    def notify_ai_rejection(
+        self,
+        symbol: str,
+        direction: str,
+        confidence: float,
+        reason: str,
+        signal_id: str,
+    ) -> None:
+        for chat_id in self.cmd_handler.allowed:
+            if self.user_prefs.get(chat_id, False):
+                self.notifier.send(
+                    fmt_ai_rejection(symbol, direction, confidence, reason, signal_id),
+                    chat_id = chat_id
+                )
 
     def notify_trade_closed(self, ct: ClosedTrade) -> None:
         """
@@ -166,7 +240,7 @@ class TelegramBot:
             ))
             self._consecutive_losses = 0   # reset on win
 
-        else:   # sl, manual, kill_switch, end_of_backtest
+        else:   # sl, manual, end_of_backtest
             self.notifier.send(fmt_trade_sl(
                 trade_id        = ct.trade_id,
                 direction       = ct.direction,
@@ -195,6 +269,87 @@ class TelegramBot:
             new_sl      = new_sl,
             closed_at   = datetime.now(timezone.utc),
         ))
+
+    def notify_system_message(self, message: str) -> None:
+        """Broadcasts a generic system alert to all allowed chats."""
+        for chat_id in self.cmd_handler.allowed:
+            self.notifier.send(message, chat_id=chat_id)
+
+    def notify_stalking_setup(self, signal: TradeSignal, mode_label: str) -> None:
+        """Sends a radar 'Pantau' alert with a 30-minute cooldown."""
+        setup_id = f"{signal.direction}"
+        now = datetime.now(timezone.utc)
+        
+        last_time = self._stalking_cooldowns.get(setup_id)
+        if last_time and (now - last_time).total_seconds() < 1800: # 30 mins
+            return # Cool cooling down...
+        
+        self._stalking_cooldowns[setup_id] = now
+        
+        from telegram.formatter import fmt_stalking_signal
+        msg = fmt_stalking_signal(
+            direction=signal.direction,
+            score=signal.score,
+            max_score=signal.max_score,
+            reason=signal.stalking_reason,
+            price=signal.entry_price,
+            sl=signal.stop_loss,
+            tp=signal.take_profit,
+            mode=mode_label,
+        )
+        for chat_id in self.cmd_handler.allowed:
+            self.notifier.send(msg, chat_id=chat_id)
+
+    def notify_trend_change(
+        self,
+        bias: str,
+        trend_strength: str,
+        adx: float,
+        ema_cross_bullish: bool,
+        price: float,
+        ema_50: float,
+        ema_200: float,
+        timeframe: str = "H1",
+        tf_confluence: Optional[dict] = None,
+        is_update: bool = False,
+    ) -> None:
+        """
+        Send trend notification. 
+        If is_update is False, only sends on bias/authority change.
+        If is_update is True, sends as a periodic status update.
+        """
+        state_id = f"{timeframe}_{bias}"
+        
+        # Guard against spamming the same status if it's NOT a periodic update
+        if not is_update and state_id == self._last_known_bias:
+            return
+        
+        self._last_known_bias = state_id
+
+        msg = fmt_trend_alert(
+            bias=bias,
+            trend_strength=trend_strength,
+            adx=adx,
+            ema_cross_bullish=ema_cross_bullish,
+            price=price,
+            ema_50=ema_50,
+            ema_200=ema_200,
+            timeframe=timeframe,
+            tf_confluence=tf_confluence,
+            is_update=is_update,
+        )
+
+        kb = {
+            "inline_keyboard": [[
+                {"text": "📊 Refresh", "callback_data": "trend:refresh"},
+                {"text": "⚙️ Settings", "callback_data": "menu:mode"}
+            ]]
+        }
+
+        for chat_id in self.cmd_handler.allowed:
+            enabled = self.trend_notify_users.get(chat_id, self._trend_notify_default)
+            if enabled:
+                self.notifier.send(msg, chat_id=chat_id, markup=kb)
 
     # ── Daily summary ─────────────────────────────────────────────────────────
 
@@ -251,6 +406,11 @@ class TelegramBot:
         if daily_loss_pct >= self._daily_loss_pct_trigger:
             triggered   = True
             description = f"Daily loss {daily_loss_pct:.2f}% >= {self._daily_loss_pct_trigger}%"
+
+        # Check C: global drawdown %
+        if pf.drawdown_pct >= self._global_drawdown_pct_trigger:
+            triggered   = True
+            description = f"Global drawdown {pf.drawdown_pct:.2f}% >= {self._global_drawdown_pct_trigger}%"
 
         if triggered and pause_manager.state == BotState.RUNNING:
             resume_at = pause_manager.pause(

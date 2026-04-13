@@ -8,7 +8,7 @@ from backtest.metrics import (
     print_report, trade_log_to_df, consecutive_losses, expectancy
 )
 from core.risk.portfolio import ClosedTrade
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class TestBacktestEngine:
@@ -55,8 +55,8 @@ class TestBacktestMetrics:
                 exit_price=1950.0 + pnl / 10,
                 lot_size=0.1,
                 pnl=pnl, pnl_pips=pnl,
-                opened_at=datetime.utcnow(),
-                closed_at=datetime.utcnow(),
+                opened_at=datetime.now(timezone.utc),
+                closed_at=datetime.now(timezone.utc),
                 reason="tp2" if pnl > 0 else "sl",
             )
             trades.append(t)

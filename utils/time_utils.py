@@ -23,5 +23,27 @@ def is_valid_session(dt: datetime) -> bool:
     return in_london or in_ny
 
 
+def get_session_name(dt: datetime) -> str:
+    """Returns the name of the session: 'ASIA', 'LONDON', 'NY' or 'TRANSITION'."""
+    hour = dt.hour
+    # Convert to UTC if it has tzinfo (everything should be UTC internally)
+    if dt.tzinfo and dt.tzinfo != timezone.utc:
+        dt = dt.astimezone(timezone.utc)
+        hour = dt.hour
+        
+    in_asian  = 0 <= hour < 9
+    in_london = 7 <= hour < 16
+    in_ny     = 12 <= hour < 21
+    
+    if in_london and in_ny:
+        return "NY" # NY/London overlap is the most volatile parts of NY
+    if in_ny:
+        return "NY"
+    if in_london:
+        return "LONDON"
+    if in_asian:
+        return "ASIA"
+    return "TRANSITION"
+
 def format_ts(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")

@@ -7,7 +7,6 @@ Thread-safe singleton used by both the trading loop and Telegram commands.
 States:
   RUNNING  — normal operation
   PAUSED   — trading suspended until resume_at OR manual /resume
-  HALTED   — kill switch active, requires manual /reset
 """
 from __future__ import annotations
 import threading
@@ -23,7 +22,6 @@ logger = get_logger(__name__)
 class BotState(str, Enum):
     RUNNING = "RUNNING"
     PAUSED  = "PAUSED"
-    HALTED  = "HALTED"    # kill switch — needs explicit reset
 
 
 class PauseManager:
@@ -88,12 +86,8 @@ class PauseManager:
     def resume(self, resumed_by: str = "manual") -> bool:
         """
         Resume trading immediately.
-        Returns False if state is HALTED (kill switch — use reset() instead).
         """
         with self._lock:
-            if self._state == BotState.HALTED:
-                logger.warning("Cannot resume: kill switch is active. Use reset_halt().")
-                return False
             if self._state == BotState.RUNNING:
                 return True   # already running
 
@@ -108,23 +102,6 @@ class PauseManager:
             except Exception as e:
                 logger.error(f"on_resume_callback error: {e}")
         return True
-
-    # ── Halt (kill switch integration) ────────────────────────────────────────
-
-    def halt(self, reason: str) -> None:
-        """Halt trading permanently (kill switch). Requires reset_halt() to clear."""
-        with self._lock:
-            self._state  = BotState.HALTED
-            self._reason = reason
-        logger.critical(f"Bot HALTED: {reason}")
-
-    def reset_halt(self, authorized_by: str = "admin") -> None:
-        """Reset a halted state (admin action)."""
-        with self._lock:
-            if self._state == BotState.HALTED:
-                self._state  = BotState.RUNNING
-                self._reason = ""
-        logger.warning(f"Halt reset by: {authorized_by}")
 
     # ── Auto-resume ───────────────────────────────────────────────────────────
 

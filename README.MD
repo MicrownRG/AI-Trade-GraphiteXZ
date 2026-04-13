@@ -25,6 +25,7 @@
 - [Trading Logic](#-trading-logic)
 - [Signal Scoring System](#-signal-scoring-system)
 - [AI Evaluation Layer](#-ai-evaluation-layer)
+- [Telegram Control & Notifications](#-telegram-control--notifications)
 - [Risk Management Engine](#-risk-management-engine)
 - [Logic Flow](#-logic-flow)
 - [Project Structure](#-project-structure)
@@ -57,6 +58,30 @@ Unlike indicator-only bots, this system replicates how institutional traders rea
 
 ## ✨ Key Features
 
+### 🚀 Advanced Trading Modes
+- **Conservative**: 0.5% risk, high score threshold (ICT-only logic).
+- **Moderate**: 1.5% risk, balanced scoring.
+- **Aggressive**: 5% risk, lower threshold, recovery logic enabled.
+- **Very Aggressive**: 15% risk, high-frequency focus, MARTINGALE recovery, + **Pulse Scalping Engine** enabled (rapid 0.01 lot injections).
+- **Ultra Scalper**: Fast high-frequency M1 RSI/Bollinger mode. Targets small 15-pip TP ($1.50 - $5.00+), compounds safely based on equity ($500+ = +0.01 lot), and strictly throttles (Wait & Snipe) when experiencing minus daily PnL.
+
+### 🛡️ Premium Anti-Liquidation
+- **Margin Level Watch**: Automatic lot scaling if margin level < 200%.
+- **News Logic**: 50% risk reduction 30m before High-Impact events.
+- **Drawdown Kill-Switch**: Hard stop at 15% daily drawdown (adjustable).
+- **Auto-BE & Partial Close**: Protects equity on structural targets (50% TP1).
+
+### ⚡ Ultra-Low Latency Execution & Micro-Scalping
+- **Live Tick Streaming**: Split-loop architecture. Caches HTF (H4/H1) every 60s while streaming LTF (M1/M5) every 3 seconds for zero-delay reaction.
+- **Pulse Scalper Engine**: Dispatches rapid 0.01 lot injections directly off M1 momentum when aligned with H1 bias. Auto-suspends if 3 consecutive losses hit to protect margins.
+- **M1 Sweep Sniper**: Filters out early entries on Order Blocks by waiting for a confirmed wick rejection (sweep) before entering.
+
+### 🧠 Hybrid Logic Engine
+- **Fibonacci MTF Strategy**: Automated Fibo retracement/extension logic across M15/M5/M1 with strict RSI bounce gates and Staged Trailing Stop-Loss (50% TP1, 25% TP2, ride TP3/Ext).
+- **SMC (Smart Money Concepts)**: Ported institutional logic (FVG, OB, Liquidity).
+- **Trend & Momentum**: Weighted scoring (EMA, ADX, RSI, BB).
+- **GainzAlgo v2 Alpha**: ATR-based BOS/CHoCH structural filtering.
+
 ### Market Structure Analysis
 - **Swing High/Low** detection using fractal-style logic
 - **BOS (Break of Structure)** — trend continuation confirmation
@@ -82,8 +107,7 @@ Unlike indicator-only bots, this system replicates how institutional traders rea
 - Dynamic **lot sizing** based on % account risk per trade
 - **Structure-based Stop Loss** — placed beyond the invalidation swing
 - **Tiered Take Profit** (TP1 at 1R, TP2 at 2R, TP3 at structure target)
-- **Trailing stop** with pip-based distance
-- **Breakeven** activation at 1R profit
+- **Zero-Trail Breakeven** — SL moves precisely to Entry (+0.01) after reaching target ratio, freezing there to guarantee a risk-free trade without premature trailing interruptions.
 - **Kill Switch** — auto-halts trading on drawdown / loss streak breach
 - **Pre-trade filters**: spread, session, daily loss, concurrent positions, ATR, RR
 
@@ -95,7 +119,11 @@ Unlike indicator-only bots, this system replicates how institutional traders rea
 - Equity curve, monthly P&L breakdown, Sharpe ratio, profit factor
 
 ### Infrastructure
+- **Cross-Platform (Linux / VPS)**: Full support for Linux execution via `mt5linux` bridge and official MetaQuotes Wine script without needing a Windows machine.
+- **Chart Snapshots**: Auto-generates annotated candlestick charts (Fibo levels, Entry, SL, TP) sent instantly to Telegram for every trade using `mplfinance`.
 - **PostgreSQL** persistence (trades, signals, performance metrics)
+- **Telegram Bot** integration (real-time alerts, remote commands, loss guard notifications)
+- **Multi-User support** (authorize multiple chat IDs to control the bot)
 - **Docker Compose** for one-command full stack deployment
 - **Rotating log files** with structured logging (Loguru + structlog)
 - **83 automated tests** covering all modules
@@ -244,6 +272,38 @@ AI_PROVIDER=gemini      # Gemini 2.0 Flash
 
 ---
 
+## 📱 Telegram Control & Notifications
+
+The system includes a dedicated Telegram bot for real-time monitoring and remote control.
+
+### Core Features
+- **Instant Alerts**: Get notified for trade entries, TP/SL hits, and breakeven shifts.
+- **Remote Commands**: Monitor status, pause/resume trading, or close positions from your phone.
+- **Adaptive Risk**: Loss Guard auto-pauses trading after consecutive losses or daily drawdown breaches.
+- **Daily Summaries**: Automatic performance report at the end of every trading day.
+
+### Bot Commands
+| Command | Description |
+|---|---|
+| `/status` | View current balance, equity, and bot state |
+| `/trades` | List all open positions with live PnL |
+| `/mode` | 🛠 Switch between 5 trading modes (Con/Mod/Agr/V-Agr/Ultra) |
+| `/mode_info` | 📑 Detail settings for each trading mode |
+| `/history` | View today's closed trades summary |
+| `/pause` | Temporarily halt new trade generation |
+| `/resume` | Resume trading mode |
+| `/pulse` | Manually reset and un-suspend the 3x Loss Guard for Pulse Scalper |
+| `/trend` | Toggle H1 Trend Change notifications on/off (default OFF) |
+| `/asian` | Toggle Asian session on/off |
+| `/partial` | Toggle Partial Close feature on/off (50% TP1) |
+| `/kill` | Emergency: activate kill switch |
+| `/help` | List all available commands & info |
+
+### Multi-User Security
+Configure `TELEGRAM_ALLOWED_CHAT_IDS` in your `.env` to allow multiple administrators. Only authorized users can issue commands.
+
+---
+
 ## 🛡 Risk Management Engine
 
 ### Lot Sizing Formula
@@ -255,6 +315,30 @@ lot_size     = risk_amount / (sl_pips × pip_value_per_lot)
 # Example: $10,000 balance, 1% risk, 20 pip SL
 # → $100 / (20 × $10) = 0.50 lots
 ```
+
+### 📈 Granular Equity Scaling (The "Measured" Path)
+Batas lot akumulasi dan per posisi dirinci secara granular untuk akurasi pertumbuhan modal:
+
+| Saldo (Equity) | Plafon Total (Kumulatif) | **Max Lot Per Entry** |
+| :--- | :--- | :--- |
+| **<$300** | 0.02 Lot | **0.01 Lot** |
+| **$301 - $500** | 0.03 Lot | **0.01 Lot** |
+| **$501 - $1000** | **0.04 Lot** | **0.01 Lot** |
+| **$1001 - $1500** | **0.06 Lot** | **0.02 Lot** |
+| **$1501 - $2500** | **0.10 Lot** | **0.03 Lot** |
+| **$2501 - $4000** | **0.20 Lot** | **0.05 Lot** |
+| **$4001 - $5000** | **0.30 Lot** | **0.06 Lot** |
+| **$5001 - $6000** | **0.35 Lot** | **0.07 Lot** |
+| **$6001 - $8000** | **0.50 Lot** | **0.10 Lot** |
+| **$8001 - $10000** | **0.65 Lot** | **0.12 Lot** |
+| **>$10000** | **1.00 Lot** | **0.20 Lot** |
+
+### 🛡️ Anti-Revenge & Stability Logic
+Bot dilengkapi dengan kontrol stabilitas untuk mencegah "revenge trading" dan *over-exposure*:
+- **Cooldown Setelah Loss**: Jeda **15 menit** setelah posisi loss untuk menenangkan market.
+- **Entry Delay Jeda**: Jeda **120 detik (2 menit)** antar entry untuk stabilitas sinyal.
+- **Profit-Lock**: Baru menambah posisi (multi-entry) jika posisi sebelumnya sedang **PROFIT**.
+- **Max Consecutive Loss**: Berhenti (Pause) 2 jam otomatis jika loss 3x berturut-turut.
 
 ### Stop Loss Placement
 SL is placed **beyond the structural invalidation level**:
@@ -286,7 +370,9 @@ Every M15 candle close:
 │
 ├─ 1. Kill switch check → if ACTIVE, halt all operations
 │
-├─ 2. Fetch data
+├─ 2. Telegram Commands → Process any incoming remote instructions
+│
+├─ 3. Fetch data
 │      H4 (200 bars) → HTF structure
 │      H1 (300 bars) → HTF confirmation
 │      M15 (300 bars) → LTF entry
@@ -332,6 +418,7 @@ Every M15 candle close:
 │      • Apply 2 pip slippage simulation
 │      • Log to PostgreSQL
 │      • Update portfolio state
+│      • Send Telegram notification (entry/AI reasoning)
 │
 └─10. Save performance snapshot to DB
 ```
@@ -402,6 +489,13 @@ trading_bot/
 │   ├── models.py                   # SQLAlchemy ORM models (signals, trades, metrics)
 │   ├── connection.py               # Engine + session factory
 │   └── repository.py               # CRUD operations for all models
+│
+├── telegram/
+│   ├── bot.py                      # Top-level bot orchestrator
+│   ├── commands.py                 # Inbound command handlers (/status, /pause, etc.)
+│   ├── notifier.py                 # Outbound message sending (Markdown-V2)
+│   ├── formatter.py                # Rich message templates (Profit/Loss alerts)
+│   └── pause_manager.py            # Global bot state (RUNNING, PAUSED, HALTED)
 │
 ├── utils/
 │   ├── logger.py                   # Rotating file logger with console output
@@ -493,6 +587,14 @@ DB_URL=postgresql+asyncpg://trader:trader@localhost:5432/trading_db
 
 # ── Mode ──────────────────────────────
 RUN_MODE=backtest             # backtest | live | paper
+
+# ── Telegram ──────────────────────────
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_primary_id
+TELEGRAM_ALLOWED_CHAT_IDS=id1,id2   # Optional: secondary admins
+TELEGRAM_LOSS_PAUSE_MINUTES=60
+TELEGRAM_CONSECUTIVE_LOSS_TRIGGER=3
+TELEGRAM_DAILY_LOSS_PCT_TRIGGER=2.0
 ```
 
 ### Step 5 — Start PostgreSQL
@@ -651,6 +753,13 @@ python main.py --mode backtest --data data/XAUUSD_M15.csv --balance 50000
 # Results saved to:
 #   results/trades_YYYYMMDD_HHMMSS.csv
 #   results/equity_YYYYMMDD_HHMMSS.csv
+
+### Backtest with Live MT5 Data
+You can also run a backtest using the latest 500 bars directly from your MT5 demo account (no CSV required):
+
+```bash
+python main.py --mode backtest --mt5
+```
 ```
 
 ### Paper Trading Mode

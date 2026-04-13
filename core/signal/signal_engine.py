@@ -57,6 +57,14 @@ class TradeSignal:
     ai_decision: str = "PENDING"
     ai_reason: str = ""
 
+    # ── Extreme & Reentry Logic ───────────────────────────────────────────────
+    is_extreme: bool = False
+    is_reentry: bool = False
+    
+    # ── Stalking / Pantau Logic ──────────────────────────────────────────────
+    is_stalking: bool = False
+    stalking_reason: str = ""
+
     @property
     def is_valid(self) -> bool:
         return (
@@ -73,9 +81,10 @@ class SignalEngine:
         self,
         df_h4: pd.DataFrame,
         df_h1: pd.DataFrame,
-        df_ltf: pd.DataFrame,   # M15 entry timeframe
+        df_ltf: pd.DataFrame,   # M15 entry timeframe (fallback)
         current_time: datetime,
         symbol: str = "XAUUSD",
+        entry_dfs: dict | None = None,  # mapping timeframe -> DataFrame for small TFs
     ) -> Optional[TradeSignal]:
         """
         Full pipeline: structure → scoring → signal creation.
@@ -83,13 +92,16 @@ class SignalEngine:
         """
         # ── 1. HTF Bias ───────────────────────────────────────────────────────
         htf_bias = calculate_htf_bias(df_h4, df_h1)
+        # Previously, a neutral HTF bias caused an early exit, preventing H1‑only signals.
+        # To allow flexibility, we now log the neutral bias but continue processing.
         if htf_bias.direction == "neutral":
-            logger.debug("No HTF bias — skipping signal generation")
-            return None
+            logger.debug("HTF bias neutral – proceeding to evaluate H1 bias and other criteria")
+            # Do not return; downstream scoring will decide if the signal is viable.
+
 
         # ── 2. Session filter ─────────────────────────────────────────────────
         session = _get_session(current_time)
-        session_valid = session in ("London", "New York", "Overlap")
+        session_valid = session in ("London", "New York", "Overlap", "Asian")
 
         # ── 3. ATR / Volatility ───────────────────────────────────────────────
         atr_series = atr(df_ltf, TRADING_CONFIG.atr_period)
@@ -116,7 +128,7 @@ class SignalEngine:
 
         # ── 7. Score ──────────────────────────────────────────────────────────
         breakdown = {
-            "htf_alignment":   self.weights["htf_alignment"]   if htf_bias.confidence >= 0.6 else 0,
+            "htf_alignment":   self.weights["htf_alignment"]   if htf_bias.confidence >= 0.45 else 0,
             "liquidity_sweep": self.weights["liquidity_sweep"]  if sweep_valid            else 0,
             "displacement":    self.weights["displacement"]     if displacement_valid      else 0,
             "session_valid":   self.weights["session_valid"]    if session_valid           else 0,
@@ -135,14 +147,19 @@ class SignalEngine:
         last_close = df_ltf["close"].iloc[-1]
         sl_distance = max(current_atr * 1.5, 10 * 0.1)  # at least 10 pips
 
+        # Dynamic RR: if score is exceptionally high, we can accept a slightly lower RR
+        target_rr = TRADING_CONFIG.score_weights.get("min_rr", 1.5)
+        if score >= 8:
+            target_rr = max(1.2, target_rr * 0.8) # Allow down to 1.2 if setup is "Perfect"
+
         if direction == "buy":
             entry = last_close
             sl    = entry - sl_distance
-            tp    = entry + sl_distance * TRADING_CONFIG.score_weights.get("min_rr", 2.0)
+            tp    = entry + sl_distance * target_rr
         else:
             entry = last_close
             sl    = entry + sl_distance
-            tp    = entry - sl_distance * TRADING_CONFIG.score_weights.get("min_rr", 2.0)
+            tp    = entry - sl_distance * target_rr
 
         rr = abs(tp - entry) / abs(sl - entry) if abs(sl - entry) > 0 else 0
 
@@ -197,10 +214,14 @@ def _get_session(dt: datetime) -> str:
     cfg  = TRADING_CONFIG
     in_london = cfg.london_session[0] <= hour < cfg.london_session[1]
     in_ny     = cfg.ny_session[0]     <= hour < cfg.ny_session[1]
+    in_asian  = cfg.asian_session[0]  <= hour < cfg.asian_session[1]
+
     if in_london and in_ny:
         return "Overlap"
     if in_london:
         return "London"
     if in_ny:
         return "New York"
+    if in_asian:
+        return "Asian"
     return "Off-Hours"

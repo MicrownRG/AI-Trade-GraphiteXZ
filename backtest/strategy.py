@@ -60,7 +60,9 @@ class AdvancedICTStrategy(BaseStrategy):
         signal = self.engine.generate(
             df_h4=df_h4,
             df_h1=df_h1,
-            df_ltf=df_ltf,
+            df_m15=df_ltf,
+            df_m5=df_m5 if df_m5 is not None else df_ltf,
+            df_m1=df_ltf,
             current_time=current_time,
         )
         if signal and df_m5 is not None and not df_m5.empty:

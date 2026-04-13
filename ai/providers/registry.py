@@ -8,6 +8,7 @@ Supported values for AI_PROVIDER:
   deepseek    → DeepSeekProvider   (default)
   anthropic   → AnthropicProvider
   gemini      → GeminiProvider
+  openai      → OpenAIProvider
 
 Usage
 ─────
@@ -23,7 +24,7 @@ You can also force a specific provider:
 Configuration (in .env or environment)
 ───────────────────────────────────────
     # Which provider to use
-    AI_PROVIDER=deepseek          # deepseek | anthropic | gemini
+    AI_PROVIDER=openai            # deepseek | anthropic | gemini | openai
 
     # DeepSeek
     DEEPSEEK_API_KEY=sk-...
@@ -51,6 +52,7 @@ _PROVIDER_MAP: dict[str, str] = {
     "deepseek":  "ai.providers.deepseek_provider.DeepSeekProvider",
     "anthropic": "ai.providers.anthropic_provider.AnthropicProvider",
     "gemini":    "ai.providers.gemini_provider.GeminiProvider",
+    "openai":    "ai.providers.openai_provider.OpenAIProvider",
 }
 
 _DEFAULT_PROVIDER = "deepseek"
