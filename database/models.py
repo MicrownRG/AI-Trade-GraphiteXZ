@@ -73,6 +73,17 @@ class TradeModel(Base):
     signal: Mapped["SignalModel | None"] = relationship("SignalModel", back_populates="trade")
 
 
+class TradeNote(Base):
+    """Event-driven notes attached to a trade (contra-exit records, SL+ TP recalibration hints, etc.)."""
+    __tablename__ = "trade_notes"
+
+    id: Mapped[str]          = mapped_column(String(36), primary_key=True, default=_uuid)
+    trade_id: Mapped[str]    = mapped_column(String(20), index=True)
+    note_type: Mapped[str]   = mapped_column(String(40))   # e.g. "contra_exit" | "sl_plus_tp_recal"
+    note: Mapped[str]        = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class PerformanceMetrics(Base):
     __tablename__ = "performance_metrics"
 

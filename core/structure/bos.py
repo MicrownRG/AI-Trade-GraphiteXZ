@@ -82,7 +82,7 @@ def _deduplicate_bos(events: List[BOSEvent]) -> List[BOSEvent]:
     for e in events[1:]:
         prev = deduped[-1]
         if e.direction == prev.direction and abs(e.broken_level - prev.broken_level) < 1e-6:
-            deduped[-1] = e   # update to latest
+            pass   # Keep FIRST break event (don't overwrite)
         else:
             deduped.append(e)
     return deduped

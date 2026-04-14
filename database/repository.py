@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from database.models import SignalModel, TradeModel, PerformanceMetrics
+from database.models import SignalModel, TradeModel, TradeNote, PerformanceMetrics
 from database.connection import get_session
 from sqlalchemy.orm import joinedload
 from core.signal.signal_engine import TradeSignal
@@ -226,6 +226,40 @@ class TradeRepository:
                 ]
         except Exception as e:
             logger.error(f"get_open_trades error: {e}")
+            return []
+
+    def save_trade_note(self, trade_id: str, note: str, note_type: str = "general") -> None:
+        """
+        Persist an event note for a trade (contra-exit, SL+ TP recalibration, etc.).
+        Called by order_manager when structural exits or trailing-stop events occur.
+        """
+        try:
+            with get_session() as session:
+                m = TradeNote(
+                    trade_id  = trade_id,
+                    note_type = note_type,
+                    note      = note,
+                )
+                session.add(m)
+        except Exception as e:
+            logger.error(f"save_trade_note error: {e}")
+
+    def get_trade_notes(self, trade_id: str) -> list:
+        """Return all notes for a given trade (most recent first)."""
+        try:
+            with get_session() as session:
+                rows = (
+                    session.query(TradeNote)
+                    .filter_by(trade_id=trade_id)
+                    .order_by(TradeNote.created_at.desc())
+                    .all()
+                )
+                return [
+                    {"note_type": r.note_type, "note": r.note, "created_at": r.created_at.isoformat()}
+                    for r in rows
+                ]
+        except Exception as e:
+            logger.error(f"get_trade_notes error: {e}")
             return []
 
     # ── Performance ───────────────────────────────────────────────────────────

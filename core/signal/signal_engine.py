@@ -92,11 +92,9 @@ class SignalEngine:
         """
         # ── 1. HTF Bias ───────────────────────────────────────────────────────
         htf_bias = calculate_htf_bias(df_h4, df_h1)
-        # Previously, a neutral HTF bias caused an early exit, preventing H1‑only signals.
-        # To allow flexibility, we now log the neutral bias but continue processing.
         if htf_bias.direction == "neutral":
-            logger.debug("HTF bias neutral – proceeding to evaluate H1 bias and other criteria")
-            # Do not return; downstream scoring will decide if the signal is viable.
+            logger.debug("HTF bias neutral — no directional signal possible")
+            return None  # Exit early if no clear direction
 
 
         # ── 2. Session filter ─────────────────────────────────────────────────
@@ -128,15 +126,32 @@ class SignalEngine:
 
         # ── 7. Score ──────────────────────────────────────────────────────────
         breakdown = {
-            "htf_alignment":   self.weights["htf_alignment"]   if htf_bias.confidence >= 0.45 else 0,
-            "liquidity_sweep": self.weights["liquidity_sweep"]  if sweep_valid            else 0,
+            "htf_alignment":   self.weights["htf_alignment"]    if (htf_bias.direction != "neutral" and htf_bias.confidence >= 0.60) else 0,
+            "liquidity_sweep": self.weights["liquidity_sweep"]  if sweep_valid             else 0,
             "displacement":    self.weights["displacement"]     if displacement_valid      else 0,
             "session_valid":   self.weights["session_valid"]    if session_valid           else 0,
             "volatility_ok":   self.weights["volatility_ok"]    if volatility_ok           else 0,
             "structure_shift": self.weights["structure_shift"]  if structure_shift         else 0,
-            "choch_confirmed": self.weights["choch_confirmed"]  if choch is not None       else 0,
+            "choch_confirmed": self.weights["choch_confirmed"]  if (choch is not None and not structure_shift) else 0,
         }
         score = sum(breakdown.values())
+
+        # ── 7b. Apply adaptive weight offsets from LearningEngine ────────────
+        # Only non-zero components receive an offset to avoid biasing absent signals.
+        try:
+            from ai.learning_engine import LearningEngine
+            from core.data.news_redis import news_client
+            _htf_bias_str = htf_bias.direction.upper() if htf_bias else "NEUTRAL"
+            _news_active  = news_client.is_news_active()
+            _learning     = LearningEngine(None)   # no repo needed for get_score_offsets
+            offsets = _learning.get_score_offsets(session, _htf_bias_str, _news_active)
+            for component, offset in offsets.items():
+                if component in breakdown and breakdown[component] != 0:
+                    adjusted = breakdown[component] + int(offset)
+                    breakdown[component] = max(0, adjusted)
+                    score = sum(breakdown.values())
+        except Exception:
+            pass  # adaptive layer is best-effort; never block a signal
 
         if score < RISK_CONFIG.min_signal_score:
             logger.debug(f"Signal score {score} below threshold {RISK_CONFIG.min_signal_score}")
@@ -150,10 +165,27 @@ class SignalEngine:
         # Dynamic RR: if score is exceptionally high, we can accept a slightly lower RR
         target_rr = TRADING_CONFIG.score_weights.get("min_rr", 1.5)
         if score >= 8:
-            target_rr = max(1.2, target_rr * 0.8) # Allow down to 1.2 if setup is "Perfect"
+            target_rr = max(1.2, target_rr * 0.8)  # Allow down to 1.2 if setup is "Perfect"
 
+        # Adaptive TP multiplier from LearningEngine (scales target_rr up/down)
+        try:
+            from ai.learning_engine import LearningEngine
+            _htf_str  = htf_bias.direction.upper() if htf_bias else "NEUTRAL"
+            _news_act = False
+            try:
+                from core.data.news_redis import news_client as _nc
+                _news_act = _nc.is_news_active()
+            except Exception:
+                pass
+            _tp_mult = LearningEngine(None).get_tp_multiplier(session, _htf_str, _news_act)
+            target_rr = round(target_rr * _tp_mult, 3)
+        except Exception:
+            pass
+
+        # Apply spread for accurate RR calc and actual entry
+        spread_price = 3.0 * 0.1  # approx 3 pips
         if direction == "buy":
-            entry = last_close
+            entry = last_close + spread_price
             sl    = entry - sl_distance
             tp    = entry + sl_distance * target_rr
         else:

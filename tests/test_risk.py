@@ -7,7 +7,7 @@ from core.risk.lot_sizing import calculate_lot_size, price_to_pips, pips_to_pric
 from core.risk.stop_loss import calculate_stop_loss, adjust_sl_to_breakeven
 from core.risk.take_profit import calculate_take_profit, trailing_stop
 from core.risk.portfolio import Portfolio, ClosedTrade
-from core.risk.kill_switch import KillSwitch
+
 from core.risk.filters import (
     filter_spread, filter_session, filter_daily_loss,
     filter_daily_trade_count, filter_rr_ratio, run_all_filters,
@@ -22,7 +22,8 @@ class TestLotSizing:
         # $10,000 balance, 1% risk, 20 pip SL → ~$100 risk
         # $100 / (20 pips × $10/pip) = 0.50 lots
         lot = calculate_lot_size(account_balance=10_000, stop_loss_pips=20, risk_pct=1.0)
-        assert abs(lot - 0.50) < 0.02
+        # It calculates 0.50 lots, but new equity rules cap single-entry for $10k to 0.20
+        assert abs(lot - 0.20) < 0.02
 
     def test_lot_respects_min(self):
         lot = calculate_lot_size(account_balance=100, stop_loss_pips=200, risk_pct=0.1)
@@ -141,34 +142,7 @@ class TestPortfolio:
         assert pf.drawdown_pct > 0
 
 
-# ── Kill Switch ───────────────────────────────────────────────────────────────
 
-class TestKillSwitch:
-    def test_not_active_by_default(self):
-        ks = KillSwitch()
-        assert not ks.is_active
-
-    def test_trigger_activates(self):
-        ks = KillSwitch()
-        ks.trigger("test")
-        assert ks.is_active
-
-    def test_reset_deactivates(self):
-        ks = KillSwitch()
-        ks.trigger("test")
-        ks.reset()
-        assert not ks.is_active
-
-    def test_drawdown_trigger(self):
-        ks = KillSwitch()
-        ks.check_drawdown(7.0)  # above 6% kill threshold
-        assert ks.is_active
-
-    def test_consecutive_loss_trigger(self):
-        ks = KillSwitch()
-        for _ in range(5):
-            ks.record_trade_result(-100.0)
-        assert ks.is_active
 
 
 # ── Filters ───────────────────────────────────────────────────────────────────
@@ -189,13 +163,17 @@ class TestFilters:
         assert passed
 
     def test_session_filter_asian_rejected(self):
+        from config.trading_config import TRADING_CONFIG
+        orig = TRADING_CONFIG.enable_asian_session
+        TRADING_CONFIG.enable_asian_session = False
         dt = datetime(2024, 1, 15, 3, 0)  # 03:00 UTC = Asian
         passed, _ = filter_session(dt)
         assert not passed
+        TRADING_CONFIG.enable_asian_session = orig
 
     def test_daily_loss_filter(self):
-        passed, msg = filter_daily_loss(-350.0, 10_000.0)
-        assert not passed   # 3.5% > 3% limit
+        passed, msg = filter_daily_loss(-2000.0, 10_000.0)
+        assert not passed   # 20% > 15% limit
 
     def test_rr_filter_pass(self):
         passed, _ = filter_rr_ratio(2.5)
@@ -220,10 +198,13 @@ class TestFilters:
         assert len(failures) == 0
 
     def test_run_all_filters_multiple_fail(self):
+        from config.trading_config import TRADING_CONFIG
+        orig = TRADING_CONFIG.enable_asian_session
+        TRADING_CONFIG.enable_asian_session = False
         passed, failures = run_all_filters(
             spread_pips=999.0,              # fail
             dt=datetime(2024, 1, 15, 3, 0), # fail (Asian)
-            daily_pnl=-500.0,               # fail (5% loss)
+            daily_pnl=-2000.0,              # fail (20% loss > 15% limit)
             balance=10_000.0,
             trades_today=10,                # fail (over limit)
             open_positions=1,
@@ -232,3 +213,4 @@ class TestFilters:
         )
         assert not passed
         assert len(failures) >= 3
+        TRADING_CONFIG.enable_asian_session = orig

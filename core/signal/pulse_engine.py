@@ -1,13 +1,20 @@
 """
-Pulse Scalping Engine - "Extreme Momentum" Mode.
+Pulse Scalping Engine — "Extreme Momentum" Mode.
 
-Designed to capture deep extreme M1 entries like the user's manual 4743 trade.
-Strategy:
-  - ONLY fires during calm (Asian / low-volatility) sessions
-  - BLOCKED during high-volatility sessions (London open, NY, Overlap)
-  - Requires RSI extreme + M1 Order Block confirmation   - SL and TP: Tight SL (1-2 pips) and Conservative TP (RR 1:3)
-  - Max concurrent same-direction entries: 3 (max lot same, not compound)
-  - Works even when account is in daily floating loss (does NOT throttle on PnL)
+Captures deep M1 extreme entries (e.g. RSI extreme + Order Block confluence)
+during calm, low-volatility sessions.
+
+Rules:
+  - BLOCKED during US session hours (NY / London-NY Overlap): spike risk is too
+    high for tight 1-2 pip SL.  SL floors in the executor handle wider SL for
+    regular entries during those sessions.
+  - ALLOWED during Asian session, Pre-London, and Late US (calm windows).
+  - Requires RSI extreme + Bollinger Band breach on M1.
+  - SL placed behind nearest M1 Order Block (or FVG fallback).
+  - TP set using conservative RR: 1.5x for Asian, 2.5x for other calm sessions.
+  - Enabled for AGGRESSIVE, VERY_AGGRESSIVE, and ULTRA_SCALPER modes.
+  - Can operate in sideways / ranging markets (Asian session is typically ranging).
+  - Max 2 concurrent Pulse positions (enforced in RiskExecutor).
 """
 from typing import Optional
 from datetime import datetime, timezone
@@ -24,24 +31,25 @@ from utils.time_utils import utc_now
 
 logger = get_logger(__name__)
 
-# Sessions defined in UTC hours
+# Volatile session windows (UTC hours) — Pulse is BLOCKED during these
 _VOLATILE_SESSIONS = {
-    "london_open": (7, 10),   # First 3 hours London: most violent
+    "london_open": (7, 10),   # First 3 hours of London: violent opening moves
     "ny_open":     (13, 16),  # NY open spike window
-    "overlap":     (12, 16),  # London-NY overlap
-    "us_close":    (19, 21),  # US close rush
+    "overlap":     (12, 16),  # London-NY overlap: highest volatility
+    "us_close":    (19, 21),  # US close rush: stop-hunt activity
 }
 
+# Calm session windows — Pulse is ALLOWED during these
 _CALM_SESSIONS = {
-    "asian":       (0, 9),    # Asian session (WIB 07:00 - 16:00)
-    "pre_london":  (5, 7),    # Pre-London drift
-    "late_us":     (21, 24),  # Late US/early Asian
+    "asian":      (0, 9),    # Asian session: low volatility, often ranging
+    "pre_london": (5, 7),    # Pre-London drift: quiet accumulation
+    "late_us":    (21, 24),  # Late US / Early Asian transition
 }
 
 
 def _is_calm_session(utc_hour: int) -> bool:
-    """Returns True if we're in a calm/landai session — safe for tight SL scalping."""
-    for name, (start, end) in _VOLATILE_SESSIONS.items():
+    """Returns True if current hour is outside all volatile session windows."""
+    for _name, (start, end) in _VOLATILE_SESSIONS.items():
         if start <= utc_hour < end:
             return False
     return True
@@ -53,13 +61,13 @@ class PulseEngine:
         self.smc   = SMCLogic()
 
     def _calculate_rsi(self, series: pd.Series, period: int = 14) -> pd.Series:
-        delta = series.diff()
-        up   = delta.clip(lower=0)
-        down = (-delta).clip(lower=0)
+        delta     = series.diff()
+        up        = delta.clip(lower=0)
+        down      = (-delta).clip(lower=0)
         roll_up   = up.ewm(com=period - 1, adjust=False).mean()
         roll_down = down.ewm(com=period - 1, adjust=False).mean()
-        RS = roll_up / roll_down
-        return 100.0 - (100.0 / (1.0 + RS))
+        rs        = roll_up / roll_down
+        return 100.0 - (100.0 / (1.0 + rs))
 
     def _calculate_bb(self, series: pd.Series, period: int = 20, num_std: float = 2.0):
         mid   = series.rolling(window=period).mean()
@@ -77,52 +85,58 @@ class PulseEngine:
         balance: float,
         is_suspended: bool = False,
         daily_pnl: float = 0.0,
-        mtf_direction: Optional[str] = None,  # "buy" | "sell" | None — pre-computed by MultiTFAnalyzer
-        **kwargs
+        mtf_direction: Optional[str] = None,  # "buy" | "sell" | None from MultiTFAnalyzer
+        **kwargs,
     ) -> Optional[TradeSignal]:
         """
-        Fires a Pulse signal ONLY in calm sessions when a M1 deep-extreme occurs
-        inside an Order Block, with tight SL and far TP (1:10+).
+        Fire a Pulse signal only during calm sessions when a deep M1 extreme occurs
+        inside an Order Block, with tight SL and conservative RR target.
+
+        Volatile US session hours block Pulse automatically — the executor's
+        session-aware SL floor still applies to regular entries during those hours.
         """
 
-        # 0. Suspension guard (Removed per user request)
-        # if is_suspended:
-        #     logger.debug("Pulse: suspended today (3x consecutive loss guard).")
-        #     return None
-
-        # 1. Session gate — BLOCK Pulse di NY/Overlap (terlalu volatile untuk SL tipis 1-2 pip)
-        now_utc = utc_now()
-        utc_hour = now_utc.hour
-        is_overlap = (12 <= utc_hour < 16)   # London-NY overlap: paling brutal
-        is_ny_open = (13 <= utc_hour < 21)   # Pure NY: still volatile
+        # 1. Session gate — block Pulse during volatile US hours
+        now_utc    = utc_now()
+        utc_hour   = now_utc.hour
+        is_overlap = (12 <= utc_hour < 16)
+        is_ny_open = (13 <= utc_hour < 21)
 
         if is_overlap:
-            logger.debug(f"Pulse: BLOCKED during London-NY Overlap ({utc_hour}:xx UTC) — spike sangat besar, SL tipis tidak aman.")
+            logger.debug(
+                f"Pulse: blocked during London-NY Overlap ({utc_hour}:xx UTC) "
+                f"— spike risk too high for tight SL."
+            )
             return None
         if is_ny_open:
-            logger.debug(f"Pulse: BLOCKED during NY session ({utc_hour}:xx UTC) — volatility tinggi, gunakan mode standard.")
+            logger.debug(
+                f"Pulse: blocked during NY session ({utc_hour}:xx UTC) "
+                f"— use standard entry engine for US hours."
+            )
             return None
 
-        # 2. Spread gate — calm sessions usually tight; reject if > 2.5 pips
-        if current_spread_pips > 2.5:
-            logger.debug(f"Pulse: spread too wide ({current_spread_pips:.1f} pips) for tight SL scalp.")
+        # 2. Spread gate — calm sessions have tight spreads; reject if too wide
+        if current_spread_pips > 3.5:
+            logger.debug(
+                f"Pulse: spread {current_spread_pips:.1f} pips too wide for tight SL scalp."
+            )
             return None
 
-        # 3. Min balance gate
+        # 3. Minimum balance gate
         if balance < 100:
             return None
 
-        # 4. Mode check
-        mode = TRADING_CONFIG.current_mode
+        # 4. Mode gate — pulse_scalping must be enabled in mode settings
+        mode     = TRADING_CONFIG.current_mode
         settings = TRADING_CONFIG.mode_settings.get(mode, {})
         if not settings.get("pulse_scalping", False):
-            logger.debug("Pulse: pulse_scalping disabled for current mode.")
+            logger.debug(f"Pulse: disabled for mode {mode.value}.")
             return None
 
-        # 5. Direction: from MultiTFAnalyzer (bidirectional), fallback to H1
+        # 5. Direction from MultiTFAnalyzer (bidirectional), fallback to H1 trend
         if mtf_direction:
             signal_dir = mtf_direction
-            logger.debug(f"Pulse: Using MTF direction: {signal_dir.upper()}")
+            logger.debug(f"Pulse: using MTF direction {signal_dir.upper()}")
         else:
             trend_h1  = self.trend.analyze_trend(df_h1)
             direction = trend_h1["bias"]
@@ -131,37 +145,47 @@ class PulseEngine:
                 return None
             signal_dir = "buy" if direction == "BULLISH" else "sell"
 
-        # 6. M1 RSI + Bollinger Band — Ujung Extreme Check
+        # 6. M1 RSI + Bollinger Band extreme check
         if len(df_m1) < 30:
             return None
 
-        rsi_m1 = self._calculate_rsi(df_m1["close"], 14)
-        bb_upper, bb_mid, bb_lower = self._calculate_bb(df_m1["close"], 20, 2.0)
+        rsi_m1               = self._calculate_rsi(df_m1["close"], 14)
+        bb_upper, _, bb_lower = self._calculate_bb(df_m1["close"], 20, 2.0)
 
-        curr_close  = df_m1["close"].iloc[-1]
-        curr_rsi    = rsi_m1.iloc[-1]
-        curr_lower  = bb_lower.iloc[-1]
-        curr_upper  = bb_upper.iloc[-1]
+        curr_close = df_m1["close"].iloc[-1]
+        curr_rsi   = rsi_m1.iloc[-1]
+        curr_lower = bb_lower.iloc[-1]
+        curr_upper = bb_upper.iloc[-1]
 
-        # Ujung Bawah → BUY: price below BB lower AND RSI oversold
-        # Ujung Atas  → SELL: price above BB upper AND RSI overbought
-        is_extreme_buy  = (curr_close <= curr_lower) and (curr_rsi < 35)
-        is_extreme_sell = (curr_close >= curr_upper) and (curr_rsi > 65)
+        # Asian session is often ranging — use relaxed RSI thresholds (40/60)
+        # Other calm sessions use tighter thresholds (35/65)
+        is_asian = (0 <= utc_hour < 9)
+        rsi_bot  = 40 if is_asian else 35
+        rsi_top  = 60 if is_asian else 65
 
-        if signal_dir == "buy"  and not is_extreme_buy:
-            logger.debug(f"Pulse: BUY but not at extreme (RSI={curr_rsi:.1f}, price={curr_close:.2f}, BB_lower={curr_lower:.2f})")
+        is_extreme_buy  = (curr_close <= curr_lower) and (curr_rsi < rsi_bot)
+        is_extreme_sell = (curr_close >= curr_upper) and (curr_rsi > rsi_top)
+
+        if signal_dir == "buy" and not is_extreme_buy:
+            logger.debug(
+                f"Pulse: BUY not at extreme "
+                f"(RSI={curr_rsi:.1f}, price={curr_close:.2f}, BB_lower={curr_lower:.2f})"
+            )
             return None
         if signal_dir == "sell" and not is_extreme_sell:
-            logger.debug(f"Pulse: SELL but not at extreme (RSI={curr_rsi:.1f}, price={curr_close:.2f}, BB_upper={curr_upper:.2f})")
+            logger.debug(
+                f"Pulse: SELL not at extreme "
+                f"(RSI={curr_rsi:.1f}, price={curr_close:.2f}, BB_upper={curr_upper:.2f})"
+            )
             return None
 
-        # 7. M1 Order Block — Place SL tightly behind it
-        obs_m1 = self.smc.get_order_blocks(df_m1)
+        # 7. SL placement — behind nearest M1 Order Block or FVG
+        obs_m1  = self.smc.get_order_blocks(df_m1)
         fvgs_m1 = self.smc.get_fvgs(df_m1)
-        
-        atr_m1 = (df_m1["high"] - df_m1["low"]).tail(20).mean()
-        # buffer: absolute max 1.5 pips for calm sessions (very tight)
-        sl_buffer = min(1.5, atr_m1 * 0.3)
+
+        atr_m1    = (df_m1["high"] - df_m1["low"]).tail(20).mean()
+        # SL buffer: slightly larger for ranging Asian market to avoid noise sweeps
+        sl_buffer = max(1.5, min(2.5, atr_m1 * 1.0))
 
         sl = None
 
@@ -180,60 +204,66 @@ class PulseEngine:
             elif signal_dir == "sell" and last_fvg["type"] == "BEARISH" and curr_close <= last_fvg["top"]:
                 sl = last_fvg["top"] + sl_buffer
 
-        # Last fallback: recent M1 swing low/high (1 hour window)
+        # Final fallback: recent M1 swing extreme (last 15 candles = ~15 min)
         if sl is None:
             if signal_dir == "buy":
                 sl = df_m1["low"].tail(15).min() - sl_buffer
             else:
                 sl = df_m1["high"].tail(15).max() + sl_buffer
 
-        # Sanity: SL must not be on wrong side
+        # Sanity check: SL distance must be meaningful
         risk_dist = abs(curr_close - sl)
         if risk_dist < 0.5:
-            logger.debug("Pulse: SL distance too small (<0.5 pt), skip.")
+            logger.debug("Pulse: SL distance < 0.5 points — skip.")
             return None
 
-        # 8. TP Calculation — Conservative RR 1:3 for 'TP Tipis-Tipis'
-        rr_multiplier = 3.0
-        
+        # 8. TP calculation — conservative RR multiplier
+        # Asian (ranging): 1.5x RR — smaller target, more likely to be hit
+        # Other calm sessions: 2.5x RR — slightly more ambitious
+        rr_multiplier = 1.5 if is_asian else 2.5
+
         if signal_dir == "buy":
-            # For Pulse, we now prioritize the conservative RR target over the long swing
             tp = curr_close + (risk_dist * rr_multiplier)
         else:
             tp = curr_close - (risk_dist * rr_multiplier)
 
-        # TP Synchronization: Align with existing trades if available
+        # TP synchronisation: align with existing trades if anchor is further
         anchor_tp = kwargs.get("anchor_tp")
         if anchor_tp:
-            # If anchor_tp is further than our calculated tp, use it
-            is_further = (signal_dir == "buy" and anchor_tp > tp) or (signal_dir == "sell" and anchor_tp < tp)
+            is_further = (
+                (signal_dir == "buy"  and anchor_tp > tp) or
+                (signal_dir == "sell" and anchor_tp < tp)
+            )
             if is_further:
-                logger.info(f"🔄 PULSE TP SYNC: Aligning target with anchor trade @ {anchor_tp:.2f}")
+                logger.info(f"Pulse TP sync: aligning with anchor trade @ {anchor_tp:.2f}")
                 tp = anchor_tp
 
         rr_actual = abs(tp - curr_close) / risk_dist if risk_dist > 0 else rr_multiplier
 
         signal = TradeSignal(
-            signal_id       = f"PULSE_{str(uuid.uuid4())[:6]}",
-            symbol          = "XAUUSD",
-            timestamp       = now_utc,
-            direction       = signal_dir,
-            entry_price     = curr_close,
-            stop_loss       = sl,
-            take_profit     = tp,
-            rr_ratio        = round(rr_actual, 1),
-            score           = 10,
-            max_score       = 10,
-            session         = "PULSE",
-            ai_decision     = "TAKE",
-            ai_reason       = f"Extreme Point RSI={curr_rsi:.0f} | OB SL={sl:.2f} | TP={tp:.2f} | RR 1:{rr_actual:.0f}",
-            ai_confidence   = 0.9,
-            is_extreme      = True,   # Enables SL+ and Pyramid upon rebound
+            signal_id     = f"PULSE_{str(uuid.uuid4())[:6]}",
+            symbol        = "XAUUSD",
+            timestamp     = now_utc,
+            direction     = signal_dir,
+            entry_price   = curr_close,
+            stop_loss     = sl,
+            take_profit   = tp,
+            rr_ratio      = round(rr_actual, 1),
+            score         = 10,
+            max_score     = 10,
+            session       = "PULSE",
+            ai_decision   = "TAKE",
+            ai_reason     = (
+                f"Extreme RSI={curr_rsi:.0f} | OB SL={sl:.2f} | "
+                f"TP={tp:.2f} | RR 1:{rr_actual:.0f}"
+            ),
+            ai_confidence = 0.9,
+            is_extreme    = True,  # enables SL+ and pyramid on rebound
         )
 
         logger.info(
-            f"⚡ PULSE EXTREME! {signal_dir.upper()} @ {curr_close:.2f} | "
-            f"SL={sl:.2f} (dist={risk_dist:.2f}pt) | TP={tp:.2f} | RR=1:{rr_actual:.0f} | "
-            f"RSI={curr_rsi:.1f} | Session: UTC={utc_hour}h"
+            f"PULSE EXTREME: {signal_dir.upper()} @ {curr_close:.2f} | "
+            f"SL={sl:.2f} (dist={risk_dist:.2f}pt) | TP={tp:.2f} | "
+            f"RR=1:{rr_actual:.0f} | RSI={curr_rsi:.1f} | UTC={utc_hour}h"
         )
         return signal

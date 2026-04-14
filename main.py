@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from config.settings import RUN_MODE, SYMBOL
 from utils.logger import get_logger
@@ -28,11 +29,11 @@ def run_backtest(data_path: str, initial_balance: float = 10_000.0, allowed_stra
     from backtest.metrics import print_report, trade_log_to_df, equity_curve_to_df
 
     if use_mt5:
-        logger.info(f"🔄 Fetching latest 10,000 bars from MT5 logic (M15)")
+        logger.info(f"🔄 Fetching latest 55,000 bars from MT5 logic (M15)")
         from execution.mt5_client import MT5Client
         mt5_tmp = MT5Client()
         mt5_tmp.connect()
-        df = fetch_from_mt5(mt5_tmp, "XAUUSD", "M15", count=10000)
+        df = fetch_from_mt5(mt5_tmp, "XAUUSD", "M15", count=55000)
         mt5_tmp.disconnect()
     else:
         logger.info(f"🔄 Loading data: {data_path}")
@@ -81,6 +82,7 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
     from telegram.bot          import TelegramBot
     from telegram.pause_manager import pause_manager
     from core.data.calendar_api import CalendarAPI
+    from core.data.news_redis   import news_client as _news_client
     from core.risk.management  import ManagementLogic
     from utils.report_formatter import format_eod_report
     from utils.time_utils      import utc_now
@@ -134,15 +136,18 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
     
     from core.signal.pulse_engine import PulseEngine
     pulse_engine = PulseEngine()
-    
+
     from core.signal.reversal_engine import ImpulseRetestEngine
     reversal_engine = ImpulseRetestEngine()
-    
+
     from core.signal.fibo_engine import FiboEngine
     fibo_engine = FiboEngine()
-    
+
     from core.signal.velocity_engine import VelocityEngine
     velo_engine = VelocityEngine()
+
+    from core.signal.mean_reversion_engine import MeanReversionEngine
+    mr_engine = MeanReversionEngine()
     
     from core.structure.multi_tf_analyzer import MultiTFAnalyzer
     multi_tf = MultiTFAnalyzer()
@@ -181,6 +186,7 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
     _last_htf_fetch_time = 0
     _last_learning_date  = None
     recovery_multiplier = 1.0
+    _last_evaluated_closed_time = portfolio.last_trade_closed_at
     df_h4        = None
     df_h1        = None
     df_m30       = None
@@ -201,6 +207,20 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
         while True:
             now = datetime.now(timezone.utc)
             
+            # Update recovery multiplier strictly based on CLOSED trades
+            if portfolio.last_trade_closed_at != _last_evaluated_closed_time:
+                _last_evaluated_closed_time = portfolio.last_trade_closed_at
+                mode_cfg = TRADING_CONFIG.mode_settings.get(TRADING_CONFIG.current_mode, {})
+                if mode_cfg.get("use_recovery", False):
+                    if portfolio.last_trade_result_pnl < 0:
+                        recovery_multiplier = min(recovery_multiplier * mode_cfg.get("recovery_multiplier", 1.5), 4.0)
+                        logger.info(f"MARTINGALE: Previous trade lost. Multiplier increased to {recovery_multiplier}x")
+                    else:
+                        recovery_multiplier = 1.0
+                        logger.info("MARTINGALE: Previous trade won. Multiplier reset to 1.0x")
+                else:
+                    recovery_multiplier = 1.0
+
             # ── Fast Loop (Every ~2s) ─────────────────────────────────────────
             # Monitoring Open Positions & Real-time Sync
             tick = mt5.get_symbol_tick(SYMBOL)
@@ -239,16 +259,24 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                             for p in active_pos:
                                 t_id = str(p.ticket)
                                 comment = p.comment.upper()
-                                # Only sync trades NOT opened by the bot
-                                if t_id not in portfolio.open_trades and "ALPHA" not in comment and "PULSE" not in comment:
+                                # Only sync trades NOT opened by the bot (avoid ALPHA, PULSE, SIG prefixes)
+                                if t_id not in portfolio.open_trades and "ALPHA" not in comment and "PULSE" not in comment and not comment.startswith("SIG:"):
                                     logger.info(f"🔄 Sync'ing Custom/Manual MT5 Trade #{t_id} into Bot Management.")
                                     
                                     actual_sl = p.sl
                                     if p.sl == 0.0:
-                                        sl_dist = price * 0.002
-                                        if df_m15_cache is not None and not df_m15_cache.empty and len(df_m15_cache) >= 10:
-                                            atr_rough = (df_m15_cache["high"].iloc[-10:] - df_m15_cache["low"].iloc[-10:]).mean()
-                                            sl_dist = max(atr_rough * 3.0, sl_dist)
+                                        sl_dist = max(price * 0.002, 1.5)  # fallback 15 pips XAUUSD
+                                        if df_m15_cache is not None and not df_m15_cache.empty and len(df_m15_cache) >= 15:
+                                            high = df_m15_cache["high"].iloc[-14:].values
+                                            low = df_m15_cache["low"].iloc[-14:].values
+                                            close = df_m15_cache["close"].iloc[-15:-1].values
+                                            if len(close) < 14: close = df_m15_cache["close"].iloc[-14:].values
+                                            hl = high - low
+                                            hc = [abs(h - c) for h, c in zip(high, close)]
+                                            lc = [abs(l - c) for l, c in zip(low, close)]
+                                            tr = [max(a, b, c) for a, b, c in zip(hl, hc, lc)]
+                                            atr_rough = sum(tr) / len(tr) if tr else 0.0
+                                            sl_dist = max(atr_rough * 2.5, sl_dist)
                                         auto_sl = p.price_open - sl_dist if p.type == 0 else p.price_open + sl_dist
                                         try:
                                             res = mt5.modify_position(p.ticket, sl=auto_sl)
@@ -287,7 +315,15 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                     except Exception as e:
                         pass
                 
-                order_manager.monitor_and_manage(price, df_m15=df_m15_cache)
+                # Pass current HTF bias so contra-exit logic can evaluate it
+                _cached_mtf_for_monitor = multi_tf.last_result
+                _htf_bias_for_monitor   = _cached_mtf_for_monitor.master_bias if _cached_mtf_for_monitor else None
+                order_manager.monitor_and_manage(
+                    price,
+                    df_m15      = df_m15_cache,
+                    htf_bias    = _htf_bias_for_monitor,
+                    news_active = False,  # updated below in full scan
+                )
 
                 # Update account info real-time for true equity tracking
                 account = mt5.get_account_info()
@@ -297,6 +333,14 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                         # Read true realized PnL exactly from MT5 deal sum
                         true_pnl = mt5.get_daily_realized_pnl()
                         portfolio.sync_true_pnl(true_pnl)
+
+                        # Hard cutloss check — close all + halt if realized loss >= 5%
+                        if order_manager.check_hard_cutloss():
+                            telegram.notifier.send(
+                                f"🔴 *HARD CUTLOSS TRIGGERED*: Realized daily loss hit "
+                                f"{portfolio.realized_daily_loss_pct:.1f}%\\. "
+                                f"All positions closed\\. Trading halted for today\\."
+                            )
                     else:
                         portfolio.update_equity(account["equity"] - account["balance"])
             
@@ -384,8 +428,17 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                 continue
                 
             margin_level = account.get("margin_level", 1000.0)
-            events = calendar.get_high_impact_events()
-            news_active = calendar.is_news_active(events)
+            # Prefer Redis (Go scraper) for news; fall back to CalendarAPI HTTP feed
+            news_active = _news_client.is_news_active()
+            if not news_active:
+                # Also check sentiment — if bearish/bullish XAU news is active flag it
+                dom_sentiment = _news_client.get_dominant_sentiment()
+            else:
+                dom_sentiment = None
+            # Legacy fallback when Redis scraper has not run yet
+            if _news_client.last_scrape_age_minutes() is None:
+                events      = calendar.get_high_impact_events()
+                news_active = calendar.is_news_active(events)
             
             # ── Pulse Scalping ───────────────────
             if ("all" in allowed_strategies or "pulse" in allowed_strategies) and tick and not paper:
@@ -438,9 +491,9 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                 if reversal_signal and not paper:
                     rev_ai = ai_scorer.evaluate(reversal_signal)
                     reversal_signal.ai_confidence = rev_ai.confidence
-                    reversal_signal.ai_reason     = reversal_signal.ai_reason  # keep engine reason
-                    if rev_ai.decision != "SKIP":  # don't skip valid reversals
-                        rev_swings = detect_swings(df_m15_cache)
+                    reversal_signal.ai_reason     = rev_ai.reason  # Use AI's actual reason
+                    if rev_ai.decision == "TAKE":  # explicit approval required
+                        rev_swings = detect_swings(df_m15_cache) if df_m15_cache is not None else []
                         rev_spread = (tick["spread"] / 10.0) if tick and "spread" in tick else 3.0
                         rev_order = risk_executor.evaluate(
                             signal=reversal_signal, df_m15=df_m15_cache, df_m5=df_m5, df_m1=df_m1,
@@ -509,7 +562,7 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                         balance=portfolio.balance
                     )
                     if velo_signal and not paper:
-                        velo_swings = detect_swings(df_m15_cache)
+                        velo_swings = detect_swings(df_m15_cache) if df_m15_cache is not None else []
                         velo_spread = (tick["spread"] / 10.0) if tick and "spread" in tick else 3.0
                         velo_order = risk_executor.evaluate(
                             signal=velo_signal, df_m15=df_m15_cache, df_m5=df_m5, df_m1=df_m1,
@@ -532,6 +585,33 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
 
 
 
+            # ── Mean Reversion Engine (Sideways harvest) ─────────────────────
+            if ("all" in allowed_strategies or "mr" in allowed_strategies) and df_m15_cache is not None and not paper:
+                try:
+                    mr_signal = mr_engine.generate(
+                        df_m15=df_m15_cache, df_m5=df_m5, current_time=now.replace(tzinfo=None), symbol=SYMBOL
+                    )
+                    if mr_signal:
+                        mr_spread = (tick["spread"] / 10.0) if tick and "spread" in tick else 3.0
+                        mr_order = risk_executor.evaluate(
+                            signal=mr_signal, df_m15=df_m15_cache, df_m5=df_m5, df_m1=df_m1,
+                            swings=[], spread_pips=mr_spread,
+                            current_time=now.replace(tzinfo=None), trades_today=trades_today,
+                            margin_level=margin_level, news_active=news_active,
+                            recovery_multiplier=recovery_multiplier,
+                            risk_pct_override=telegram.get_current_risk_pct(),
+                        )
+                        if mr_order and mr_order.approved:
+                            tid = order_manager.execute(mr_order, signal_meta={
+                                "score": mr_signal.score, "session": mr_signal.session,
+                                "strategy": "〰️ Mean Reversion",
+                            }, df_m15=df_m15_cache, df_m5=df_m5)
+                            if tid:
+                                trades_today += 1
+                                logger.info(f"〰️ Mean Reversion executed: {mr_signal.signal_id}")
+                except Exception as e:
+                    logger.debug(f"MeanReversion scan error (non-critical): {e}")
+
             # ── Generate signal (Standard) ───────
             if "all" in allowed_strategies or "smc" in allowed_strategies:
                 signal = signal_engine.generate(
@@ -544,7 +624,9 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                     repo.save_signal(signal)
                     if signal.is_stalking:
                         telegram.notify_stalking_setup(signal, mode_label=TRADING_CONFIG.current_mode.value)
-                        repo.save_performance_snapshot(portfolio, trades_today, account_id=cached_acc_id)
+                        if time.time() - _last_performance_time > 900:
+                            repo.save_performance_snapshot(portfolio, trades_today, account_id=cached_acc_id)
+                            _last_performance_time = time.time()
                         continue
 
                     ai_eval = ai_scorer.evaluate(signal)
@@ -571,8 +653,6 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                             }, df_m15=df_m15_cache, df_m5=df_m5)
                             if tid:
                                 trades_today += 1
-                                if TRADING_CONFIG.current_mode == TradeMode.VERY_AGGRESSIVE:
-                                    recovery_multiplier = min(recovery_multiplier * 1.5, 4.0)
 
             # ── Performance snapshot (15m) ──────
             if time.time() - _last_performance_time > 900:
@@ -580,8 +660,8 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                 _last_performance_time = time.time()
 
             # ── EOD AI Retrospective (23:00 Local) ──
-            local_now = datetime.now()
-            if local_now.hour == 23 and local_now.minute == 0 and _last_learning_date != local_now.date():
+            local_now = datetime.now(ZoneInfo("Asia/Jakarta"))
+            if local_now.hour == 23 and local_now.minute < 3 and _last_learning_date != local_now.date():
                 logger.info("🧠 Triggering Automated EOD AI Retrospective Analysis...")
                 try:
                     # Analyze slightly more trades for the EOD report
@@ -592,7 +672,13 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                 except Exception as e:
                     logger.error(f"EOD Auto-trigger failed: {e}")
 
-            logger.info(f"Cycle ✓ | equity={portfolio.equity:.2f} dd={portfolio.drawdown_pct:.2f}%")
+            logger.info(
+                f"Cycle OK | equity={portfolio.equity:.2f} "
+                f"dd={portfolio.drawdown_pct:.2f}% "
+                f"open_risk=${portfolio.total_open_risk_usd:.2f} "
+                f"daily_pnl=${portfolio.daily_pnl:.2f} "
+                f"open={portfolio.open_trade_count}"
+            )
 
     except KeyboardInterrupt:
         logger.info("🛑 Shutdown triggered")

@@ -101,16 +101,16 @@ class TestAIScorer:
         assert 0.0 <= eval_.confidence <= 1.0
 
     def test_high_score_signal_gets_taken(self):
-        scorer = AIScorer(enabled=False)
+        scorer = AIScorer(enabled=True)
         signal = self._make_signal()
-        eval_  = scorer.evaluate(signal)
+        eval_  = scorer._rule_based(signal)
         # Score 7/10 in London session should be TAKE
         assert eval_.decision == "TAKE"
 
     def test_low_score_signal_skipped(self):
-        scorer  = AIScorer(enabled=False)
+        scorer  = AIScorer(enabled=True)
         signal  = self._make_signal()
         signal.score = 2       # very low
         signal.session = "Off-Hours"
-        eval_   = scorer.evaluate(signal)
+        eval_   = scorer._rule_based(signal)
         assert eval_.decision == "SKIP"

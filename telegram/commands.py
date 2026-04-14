@@ -224,6 +224,8 @@ class CommandHandler:
             "/sell":      lambda c, a: self._cmd_manual_entry(c, a, "sell"),
             "/eod":       self._cmd_eod,
             "/cutloss":   self._cmd_cutloss,
+            "/adapter":   self._cmd_adapter,
+            "/backtest":  self._cmd_backtest,
         }
 
         fn = handlers.get(cmd)
@@ -498,6 +500,14 @@ class CommandHandler:
                 self._answer_callback(cq_id, "✅ Stalking logs cleared")
                 self._edit_message(chat_id, cq.get("message", {}).get("message_id"), "👀 *Pantau Spam Cooldown Cleared*\\.")
 
+            elif action == "cutloss":
+                self.bot_ref.portfolio.daily_cutloss_triggered = False
+                self._answer_callback(cq_id, "✅ Hard Cutloss flag cleared")
+                self._edit_message(
+                    chat_id, cq.get("message", {}).get("message_id"),
+                    "🔴 *Hard Cutloss Flag Cleared*\\.\nBot can enter new trades\\. Use responsibly\\."
+                )
+
         elif data == "ignore":
             self._answer_callback(cq_id)
 
@@ -623,6 +633,8 @@ class CommandHandler:
             current_mode       = TRADING_CONFIG.current_mode.value,
             ai_enabled         = USE_AI,
             pulse_suspended    = pf.pulse_suspended_today,
+            cutloss_triggered  = pf.daily_cutloss_triggered,
+            realized_loss_pct  = pf.realized_daily_loss_pct,
         )
         self._reply(chat_id, msg)
 
@@ -690,17 +702,27 @@ class CommandHandler:
         ))
 
     def _cmd_cutloss(self, chat_id: str, args: list) -> None:
-        """Close all positions (Panic Close). Does not halt the bot."""
+        """Close all positions (Panic Close). If hard cutloss is active, shows status only."""
         if not hasattr(self, "bot_ref") or not self.bot_ref:
             self._reply(chat_id, "⚠️ Bot reference is missing\\. Cannot close positions\\.")
             return
 
-        closed_count = self.bot_ref.order_manager.close_all_positions(reason="manual_cutloss")
-        
+        pf = self.portfolio
+        if pf.daily_cutloss_triggered:
+            self._reply(chat_id, (
+                f"🔴 *HARD CUTLOSS ALREADY ACTIVE*\n"
+                f"{'─'*20}\n"
+                f"Realized daily loss: `{pf.realized_daily_loss_pct:.1f}%`\n"
+                f"Trading is halted for today\\. Use `/reset` to clear if needed\\."
+            ))
+            return
+
+        self.bot_ref.order_manager.close_all_positions(reason="manual_cutloss")
+
         self._reply(chat_id, (
             f"🚨 *GLOBAL CUT LOSS ACTIVATED* 🚨\n"
             f"{'─'*20}\n"
-            f"✅ Sent close/cover signal to *{closed_count}* MT5 positions\\.\n"
+            f"✅ Close signal sent to all open MT5 positions\\.\n"
             f"🟢 Bot remains *RUNNING* and will hunt for new signals\\.\n"
         ))
 
@@ -719,13 +741,16 @@ class CommandHandler:
 
 
     def _cmd_reset(self, chat_id: str, args: list) -> None:
+        pf = self.portfolio
+        cutloss_label = "🔴 Reset Hard Cutloss (ACTIVE)" if pf.daily_cutloss_triggered else "🔴 Reset Hard Cutloss"
         msg = "🛠️ *Cooldown Manager*\n\nPilih batasan yang ingin dihapus paksa:"
         kb = {
             "inline_keyboard": [
                 [{"text": "🔄 Reset ALL Cooldowns", "callback_data": "reset:all"}],
                 [{"text": "⏱️ Reset Revenge Timer", "callback_data": "reset:revenge"}],
                 [{"text": "⚡ Reset Pulse Guard", "callback_data": "reset:pulse"}],
-                [{"text": "👀 Reset Pantau Limiter", "callback_data": "reset:stalk"}]
+                [{"text": "👀 Reset Pantau Limiter", "callback_data": "reset:stalk"}],
+                [{"text": cutloss_label, "callback_data": "reset:cutloss"}],
             ]
         }
         self._reply(chat_id, msg, kb)
@@ -874,6 +899,91 @@ class CommandHandler:
             self._reply(chat_id, "⚠️ Pulse Scalping is DISABLED in the current Trade Mode. Switch to VERY_AGGRESSIVE to use it.")
         else:
             self._reply(chat_id, "ℹ️ Pulse Scalping is actively running and has not hit the 3x Loss Guard limit yet.")
+
+    def _cmd_adapter(self, chat_id: str, args: list) -> None:
+        """Toggle the AI Adaptive Learning Engine on or off."""
+        try:
+            from ai.learning_engine import LearningEngine
+            new_state = LearningEngine.toggle_adapter()
+        except Exception as e:
+            self._reply(chat_id, f"⚠️ Adapter toggle failed: {str(e)[:80]}")
+            return
+
+        state_str = "ON ✅" if new_state else "OFF 🔕"
+        weights_path = "knowledge/adaptive_weights.json"
+
+        msg = (
+            f"🤖 *AI Adapter: {state_str}*\n"
+            f"{'─' * 20}\n\n"
+        )
+        if new_state:
+            msg += (
+                "The adaptive scoring engine is now *active*\\.\n"
+                "Score\\-weight offsets and TP multipliers from past trade analysis "
+                "will be applied each signal cycle\\.\n\n"
+                f"Weights file: `{weights_path}`"
+            )
+        else:
+            msg += (
+                "The adaptive scoring engine is now *disabled*\\.\n"
+                "Signal scoring will use the fixed default weights\\.\n"
+                "Past analysis remains saved and will be reloaded when re\\-enabled\\."
+            )
+        self._reply(chat_id, msg)
+
+    def _cmd_backtest(self, chat_id: str, args: list) -> None:
+        """
+        Run multi-mode backtest in background and post results to Telegram.
+        Usage: /backtest [years] [balance]
+        Example: /backtest 2 10000
+        """
+        try:
+            years   = int(args[0]) if len(args) >= 1 else 2
+            balance = float(args[1]) if len(args) >= 2 else 10_000.0
+            years   = max(1, min(years, 5))   # cap: 1–5 years
+        except (ValueError, IndexError):
+            self._reply(chat_id, "⚠️ Usage: `/backtest [years] [balance]`  e.g. `/backtest 2 10000`")
+            return
+
+        self._reply(
+            chat_id,
+            f"🔄 *Backtest started* — {years}yr history, balance\\=${balance:,.0f}\n"
+            f"Running all modes\\. This may take a few minutes\\."
+        )
+
+        def _run():
+            try:
+                from backtest.runner import _fetch_data, _ALL_MODES, run_backtest_for_mode
+                from backtest.report import save_reports, generate_md
+
+                df = _fetch_data(years)
+                results = {}
+                for mode in _ALL_MODES:
+                    try:
+                        results[mode.value] = run_backtest_for_mode(mode, df, balance)
+                    except Exception as e:
+                        logger.error(f"Backtest mode {mode.value} failed: {e}")
+
+                if not results:
+                    self._reply(chat_id, "⚠️ Backtest produced no results\\.")
+                    return
+
+                md_path, csv_path = save_reports(results, balance)
+                table = generate_md(results, balance)
+
+                # Telegram message cap ~4096 chars — trim if needed
+                if len(table) > 3800:
+                    table = table[:3800] + "\n\\.\\.\\."
+                # Escape MarkdownV2 special chars that aren't already escaped
+                import re
+                safe = re.sub(r'(?<!\\)([+\-])', r'\\\1', table)
+                self._reply(chat_id, f"```\n{safe}\n```\n\n📁 CSV saved: `{csv_path}`")
+            except Exception as e:
+                logger.error(f"Backtest command failed: {e}", exc_info=True)
+                self._reply(chat_id, f"⚠️ Backtest error: {str(e)[:100]}")
+
+        import threading
+        threading.Thread(target=_run, daemon=True, name="tg_backtest").start()
 
     def _cmd_trend(self, chat_id: str, from_id: str, args: list) -> None:
         """Dashboard for Trend Alerts and Multi-TF Engine control."""
@@ -1053,6 +1163,7 @@ class CommandHandler:
         commands = [
             {"command": "help",    "description": "Show command list and menu"},
             {"command": "status",  "description": "Bot state, balance, and drawdown"},
+            {"command": "positions", "description": "List all open positions and PnL"},
             {"command": "today",   "description": "Trades and P&L today"},
             {"command": "balance", "description": "Quick balance check"},
             {"command": "pnl",     "description": "P&L summary this week"},

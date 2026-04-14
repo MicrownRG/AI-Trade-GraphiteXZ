@@ -71,8 +71,33 @@ class AdvancedSignalEngine(SignalEngine):
             )
             direction = mtf.direction
             
-            # Confidence bonus from confluence score
-            score += int(max(mtf.bull_score, mtf.bear_score) / 3)  # up to ~7 pts
+            # Fibo Multi-TF Analysis bonus
+            if TRADING_CONFIG.current_mode != TradeMode.CONSERVATIVE:
+                try:
+                    from core.structure.swing import detect_swings
+                    h1_swings = detect_swings(df_h1)
+                    if len(h1_swings) >= 2:
+                        last_h = [s.price for s in h1_swings if s.kind == 'high']
+                        last_l = [s.price for s in h1_swings if s.kind == 'low']
+                        if last_h and last_l:
+                            rng = last_h[-1] - last_l[-1]
+                            price_now = df_h1['close'].iloc[-1]
+                            if direction == "buy" and rng > 0:
+                                pullback = (last_h[-1] - price_now) / rng
+                                if 0.5 <= pullback <= 0.886:
+                                    score += 2
+                                    logger.info(f"📐 FIBO MULTI-TF: H1 Golden Pocket / Deep Retracement Hit ({pullback:.1%} pullback)")
+                            elif direction == "sell" and rng > 0:
+                                pullback = (price_now - last_l[-1]) / rng
+                                if 0.5 <= pullback <= 0.886:
+                                    score += 2
+                                    logger.info(f"📐 FIBO MULTI-TF: H1 Premium Golden Pocket Hit ({pullback:.1%} pullback)")
+                except Exception as e:
+                    pass
+                    
+            # Confidence bonus from confluence score (cap at 3 pts maximum to prevent score inflation)
+            confluence_pts = int(max(mtf.bull_score, mtf.bear_score) / 10)
+            score += min(confluence_pts, 3)
             
             # --- AGGRESSIVE ZONE HIT BONUS ---
             # If we are hitting an HTF Support/Resistance, give a massive boost
@@ -83,7 +108,7 @@ class AdvancedSignalEngine(SignalEngine):
             is_at_resis   = (h4 and h4.at_zone == "BEARISH_OB") or (h1 and h1.at_zone == "BEARISH_OB")
             
             if (direction == "buy" and is_at_support) or (direction == "sell" and is_at_resis):
-                score += 5
+                score += 3
                 logger.info(f"🛡️ STRONG ZONE HIT: Price is at HTF Support/Resistance zone. Approving Aggressive Entry.")
 
             if mtf.is_strong:
@@ -111,9 +136,9 @@ class AdvancedSignalEngine(SignalEngine):
             # Simple bias: H1 is king
             if trend_h1["bias"] != "NEUTRAL":
                 direction = "buy" if trend_h1["bias"] == "BULLISH" else "sell"
-                score = 5 # Base score for being aligned with H1
+                score = 3 # Base score for being aligned with H1
                 if trend_h1["bias"] == trend_h4["bias"]:
-                    score += 3 # Convergence bonus
+                    score += 2 # Convergence bonus
             else:
                 direction = None
                 score = 0
@@ -122,10 +147,10 @@ class AdvancedSignalEngine(SignalEngine):
             master_bias = trend_h1["bias"]
 
         if not direction:
-            logger.info(f"Signal Multi-Logic: No bias detected (Multi-TF: {TRADING_CONFIG.enable_multi_tf})")
+            logger.info(f"Signal: no bias detected (multi_tf={TRADING_CONFIG.enable_multi_tf})")
             return None
 
-        # Create a stable key for this session's setup to prevent log spamming
+        # Stable key to deduplicate repeated log messages for the same setup
         signal_key = f"{symbol}_{direction}"
         
         # ADX confirmation bonus
@@ -133,8 +158,7 @@ class AdvancedSignalEngine(SignalEngine):
             score += 1
 
         # ── 2. SMC Structure (M15) ────────────────────────────────────────────
-        # Master bias is our "patokan besar"
-        # master_bias is already set in the block above
+        # master_bias is already set in the block above — used as the primary filter
         
         structures = self.smc.detect_structure(df_m15)
         obs = self.smc.get_order_blocks(df_m15)
@@ -147,10 +171,10 @@ class AdvancedSignalEngine(SignalEngine):
 
             if struct_bias == master_bias:
                 # Structure confirms HTF trend (master)
-                score += 3 if last_structure.type == "BOS" else 2
+                score += 2 if last_structure.type == "BOS" else 1
             elif last_structure.type == "CHOCH" and struct_bias == ( "BULLISH" if direction == "buy" else "BEARISH" ):
                 # CHoCH confirms our intended direction (even if against master trend)
-                score += 3
+                score += 2
                 logger.info(f"🔄 CHoCH CONFIRMED for {direction.upper()} reversal direction.")
 
         # Order Block alignment
@@ -161,9 +185,9 @@ class AdvancedSignalEngine(SignalEngine):
             in_bearish_ob = last_ob["type"] == "BEARISH" and last_ob["low"] <= price_now <= last_ob["high"]
 
             if in_bullish_ob and direction == "buy":
-                score += 3
+                score += 2
             elif in_bearish_ob and direction == "sell":
-                score += 3
+                score += 2
 
         # FVG alignment bonus
         aligned_fvgs = [f for f in (fvgs_m15 + fvgs_m5)[-10:]
@@ -190,13 +214,14 @@ class AdvancedSignalEngine(SignalEngine):
                     
             if (direction == "buy" and div == "BULLISH") or (direction == "sell" and div == "BEARISH"):
                 logger.info(f"🎯 INSTITUTIONAL MOMENTUM DIVERGENCE DETECTED on {direction.upper()}!")
-                score += 5  # Massive bonus for Sniper entry
+                score += 3  # Bonus for Sniper entry
 
-        logger.info(f"Signal Multi-Logic Score: {score}/{threshold} (Mode: {mode.value}, Bias: {master_bias}, Dir: {direction})")
+        logger.info(f"Signal score: {score}/{threshold} (mode={mode.value} bias={master_bias} dir={direction})")
 
         # ── 4. Hidden RSI Divergence Bonus (No.24) ────────────────────────
-        # Hidden Divergence = tren lanjut: price makes higher low (bull) but RSI lower low
-        # Atau: price makes lower high (bear) but RSI higher high
+        # Hidden divergence = trend continuation:
+        #   Bull: price makes higher low + RSI lower low (momentum diverges, trend continues)
+        #   Bear: price makes lower high + RSI higher high
         try:
             rsi_m15 = scalp_m15.get("rsi", 50)
             rsi_m5  = scalp_m5.get("rsi", 50)
@@ -252,15 +277,15 @@ class AdvancedSignalEngine(SignalEngine):
         except Exception:
             pass
 
-        logger.info(f"Signal Multi-Logic FINAL Score: {score}/{threshold} (after all bonuses)")
+        logger.info(f"Signal FINAL score: {score}/{threshold} (after all bonuses)")
 
         if score >= threshold and direction:
             current_price = df_m1["close"].iloc[-1]
             atr_val = (df_m15["high"] - df_m15["low"]).tail(20).mean()
             atr_m1  = (df_m1["high"] - df_m1["low"]).tail(20).mean()
 
-            # ── "Absolute Extreme" Entry & Tight SL Manager ──────────────────────
-            # We scan M1 and M5 specifically for the absolute extreme to hide our SL.
+            # ── Precision M1 entry and tight SL using structural zones ──────────────
+            # Scan M1 and M5 for Order Blocks and FVGs to place SL tightly.
             obs_m1  = self.smc.get_order_blocks(df_m1)
             obs_m5  = self.smc.get_order_blocks(df_m5)
             fvgs_m1 = self.smc.get_fvgs(df_m1)
@@ -298,6 +323,23 @@ class AdvancedSignalEngine(SignalEngine):
             
             # If extreme, use razor-thin SL. Otherwise pad it using session buffer and M1 ATR
             buffer_pips = 0.3 if is_extreme else max(session_buffer, atr_m1 * 0.5) 
+            
+            # Fibonacci 12.7% tight SL optimisation:
+            # Replace oversized ATR buffer with 12.7% of M5 swing range for tighter risk.
+            try:
+                from core.structure.swing import detect_swings
+                swings_m5 = detect_swings(df_m5.tail(100))
+                if len(swings_m5) >= 2:
+                    sh = [s.price for s in swings_m5 if s.kind == 'high']
+                    sl = [s.price for s in swings_m5 if s.kind == 'low']
+                    if sh and sl:
+                        fibo_range = sh[-1] - sl[-1]
+                        if fibo_range > 0:
+                            fibo_buffer = fibo_range * 0.127  # 12.7% extension limit
+                            buffer_pips = min(buffer_pips, max(0.5, fibo_buffer))
+                            logger.info(f"📐 Fibo SL Optimization: Buffer tightened to {buffer_pips:.1f} using 12.7% Extension")
+            except Exception:
+                pass
             
             # 1. Prioritize M1 Order Block for tightest possible SL
             if obs_m1:
@@ -377,11 +419,13 @@ class AdvancedSignalEngine(SignalEngine):
             is_stalking = False
             stalking_reason = ""
             
-            # --- Pantau (Stalking) Logic for Moderate & Conservative ---
+            # Stalking mode for Conservative & Moderate:
+            # Setup is mature but price has not yet entered the structural zone.
+            # Notify via Telegram and wait — do NOT enter early.
             if not in_zone and mode in (TradeMode.MODERATE, TradeMode.CONSERVATIVE):
-                if score >= threshold - 1: # High maturity, just waiting for price
-                    is_stalking = True
-                    stalking_reason = "Waiting for price to enter 'Extreme' zone (M1/M5 OB/FVG)"
+                if score >= threshold - 1:
+                    is_stalking     = True
+                    stalking_reason = "Waiting for price to enter the M1/M5 OB/FVG zone"
             
             if not in_zone and not is_stalking:
                 logger.info(f"Signal Multi-Logic Score {score} OK, but price is not in M1 'Extreme' zone yet. Waiting for retracement.")
@@ -389,7 +433,7 @@ class AdvancedSignalEngine(SignalEngine):
             
             # If we are stalking, we still calculate hypothetical SL/TP for the radar report
             if is_stalking:
-                logger.info(f"📡 [PANTAU] Setup matang (Score {score}). {stalking_reason}")
+                logger.info(f"[STALKING] Mature setup (score {score}). {stalking_reason}")
 
             # 4. Calculate safe distance
             min_risk = (df_m1["high"] - df_m1["low"]).tail(20).mean() * 1.5
@@ -436,9 +480,9 @@ class AdvancedSignalEngine(SignalEngine):
                     logger.info(f"🔄 TP SYNC: Aligning extreme signal target with anchor trade @ {anchor_tp:.2f}")
                     raw_target = anchor_tp
 
-            # OPTIMALKAN HARGA PASTI (Inward Buffer)
-            # Tarik mundur TP 1.5 - 2.0 pips ke arah dalam untuk memastikan harga kesentuh 
-            # dan tidak meleset/front-run oleh spread atau ekor lilin ekstrem.
+            # Inward TP buffer (1.5–2.0 pips):
+            # Pull TP slightly inside the raw target to ensure it is reached
+            # before spread or wick overshoot can front-run the exit.
             tp_buffer_pips = max(1.5, atr_m1 * 0.4)
             if direction == "buy":
                 take_profit = raw_target - tp_buffer_pips

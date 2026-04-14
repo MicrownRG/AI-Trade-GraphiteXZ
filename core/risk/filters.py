@@ -1,11 +1,11 @@
 """
-Pre-trade filters.  Each filter returns (passed: bool, reason: str).
+Pre-trade filters. Each filter returns (passed: bool, reason: str).
 A trade is executed only if ALL filters pass.
 
-Smart filters (non-blocking, execution-supporting):
-  - filter_weekly_open    (No.77): larang trade berlawanan weekly trend
-  - filter_daily_exhaustion (No.98): Gold lari >330 pip searah → expect reversal
-  - filter_choppiness     (No.23): tolak jika market terlalu choppy (rendahnya ATR ratio)
+Smart filters (non-blocking context filters):
+  - filter_weekly_open    (No.77): block trades against weekly open trend
+  - filter_daily_exhaustion (No.98): gold moved >330 pips today -> expect reversal
+  - filter_choppiness     (No.23): reject if market is too choppy (low ATR ratio)
 """
 from __future__ import annotations
 from typing import Tuple, Optional
@@ -13,7 +13,7 @@ import pandas as pd
 from datetime import datetime, time as dtime, timezone
 
 from config.risk_config import RISK_CONFIG
-from config.trading_config import TRADING_CONFIG
+from config.trading_config import TRADING_CONFIG, TradeMode
 from utils.logger import get_logger
 from core.risk.safety import SafetyManager
 
@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 FilterResult = Tuple[bool, str]
 
 # Daily exhaustion threshold (pips): if gold ran this far in one direction today,
-# consider mean reversion likely (No.98)
+# mean reversion is likely — block same-direction entries (No.98)
 _DAILY_EXHAUSTION_PIPS = 330.0
 
 
@@ -45,16 +45,27 @@ def filter_session(dt: datetime) -> FilterResult:
     return False, f"Outside trading sessions (hour={hour} UTC)"
 
 
-def filter_daily_loss(current_daily_pnl: float, account_balance: float) -> FilterResult:
-    pct = abs(current_daily_pnl) / account_balance * 100 if account_balance > 0 else 0
-    limit = RISK_CONFIG.max_daily_loss_pct
-    if current_daily_pnl < 0 and pct >= limit:
-        return False, f"Daily loss {pct:.2f}% reached limit {limit}%"
+def filter_daily_loss(realized_pnl: float, account_balance: float) -> FilterResult:
+    """Gate on REALIZED (closed) daily losses only. Floating losses are ignored."""
+    if realized_pnl >= 0 or account_balance <= 0:
+        return True, "OK"
+    pct = abs(realized_pnl) / account_balance * 100
+    limit = RISK_CONFIG.hard_cutloss_daily_pct
+    if pct >= limit:
+        return False, f"Realized daily loss {pct:.2f}% reached hard cutloss limit {limit}%"
     return True, "OK"
 
 
 def filter_daily_trade_count(trades_today: int) -> FilterResult:
-    # Unlimited daily trades — no cap enforced
+    """
+    For Conservative / Moderate modes, cap daily trade count to avoid over-trading.
+    Aggressive modes have no daily cap (max_daily_trades = 0).
+    """
+    mode = TRADING_CONFIG.current_mode
+    settings = TRADING_CONFIG.mode_settings.get(mode, {})
+    max_trades = settings.get("max_daily_trades", 0)
+    if max_trades > 0 and trades_today >= max_trades:
+        return False, f"Daily trade cap reached ({trades_today}/{max_trades} for {mode.value})"
     return True, "OK"
 
 
@@ -67,13 +78,13 @@ def filter_concurrent_positions(open_positions: int) -> FilterResult:
 
 def filter_volatility(atr_pips: float, session: str = "") -> FilterResult:
     min_limit = TRADING_CONFIG.min_atr_pips
-    
-    # Relax min ATR for high-volume sessions (Overlap/London)
+
+    # Relax minimum ATR requirement in high-volume sessions (Overlap/London)
     if session in ("Overlap", "London"):
-        min_limit *= 0.7  # 30% reduction in requirements
-        
+        min_limit *= 0.7  # 30% reduction
+
     if atr_pips < min_limit:
-        return False, f"ATR {atr_pips:.1f} pips too low (limit {min_limit:.1f})"
+        return False, f"ATR {atr_pips:.1f} pips too low (min {min_limit:.1f})"
     if atr_pips > TRADING_CONFIG.max_atr_pips:
         return False, f"ATR {atr_pips:.1f} pips too high (extreme volatility)"
     return True, "OK"
@@ -87,9 +98,8 @@ def filter_rr_ratio(rr: float) -> FilterResult:
 
 
 def filter_max_risk(calculated_risk_pct: float) -> FilterResult:
-    # Mode-based max risk is already handled in lot_sizing, 
-    # but we keep a hard safety cap at 20% for Extreme modes.
-    limit = 20.0 
+    # Hard safety cap — mode-based caps are enforced earlier in lot_sizing
+    limit = 20.0
     if calculated_risk_pct > limit:
         return False, f"Risk {calculated_risk_pct:.1f}% exceeds absolute safety cap {limit}%"
     return True, "OK"
@@ -102,60 +112,92 @@ def filter_margin_level(margin_level: float) -> FilterResult:
 
 
 def filter_news(news_active: bool) -> FilterResult:
-    if news_active and TRADING_CONFIG.current_mode == "CONSERVATIVE":
-         return False, "High-impact news blackout active"
+    """
+    Conservative mode: fully block trading during high-impact news events.
+    Moderate mode: allow trading but risk is already reduced 50% via lot sizing.
+    Aggressive and above: news does not block entry.
+    """
+    if news_active and TRADING_CONFIG.current_mode == TradeMode.CONSERVATIVE:
+        return False, "High-impact news blackout active (Conservative mode)"
     return True, "OK"
 
 
-# Global variable to bypass cooldowns when user resets via Telegram
+# Global variable: set when user manually resets cooldown via Telegram
 GLOBAL_COOLDOWN_CLEARED_AT: Optional[datetime] = None
+
 
 def filter_cooldown(last_closed_at: Optional[datetime], last_pnl: float) -> FilterResult:
     if last_closed_at is None or last_pnl >= 0:
         return True, "OK"
-        
+
     global GLOBAL_COOLDOWN_CLEARED_AT
     if GLOBAL_COOLDOWN_CLEARED_AT and last_closed_at < GLOBAL_COOLDOWN_CLEARED_AT:
         return True, "OK"
-    
+
     elapsed = (datetime.now(timezone.utc) - last_closed_at).total_seconds() / 60.0
     limit = RISK_CONFIG.revenge_cooldown_min
     if elapsed < limit:
-        return False, f"Anti-Revenge: Cooldown active ({int(limit - elapsed)}m remaining)"
+        return False, f"Anti-revenge cooldown active ({int(limit - elapsed)}m remaining)"
     return True, "OK"
 
 
 def filter_entry_delay(last_opened_at: Optional[datetime], atr_pips: Optional[float] = None) -> FilterResult:
     if last_opened_at is None:
         return True, "OK"
-    
+
     elapsed = (datetime.now(timezone.utc) - last_opened_at).total_seconds()
-    
-    # ── ADAPTIVE TIME LOGIC ──
+
+    # Adaptive delay by mode — aggressive modes use shorter gaps for frequent entries
     mode = TRADING_CONFIG.current_mode.value
     if mode in ("ULTRA_SCALPER", "VERY_AGGRESSIVE"):
-        base_limit = 120  # 2 mins
+        base_limit = 120  # 2 min
     elif mode == "AGGRESSIVE":
-        base_limit = 180  # 3 mins
+        base_limit = 180  # 3 min
     elif mode == "MODERATE":
-        base_limit = 240  # 4 mins
+        base_limit = 240  # 4 min
     else:
-        base_limit = 300  # 5 mins
-        
-    # Volatility Check: Mengerem jika candle terlalu liar
-    # (M1 ATR > 25 pips berarti 1 candle gerak $2.5, sangat volatil!)
+        base_limit = 300  # 5 min (Conservative)
+
+    # Extra 60s cooldown if M1 ATR is very high (> 25 pips per candle = whipsaw risk)
     if atr_pips and atr_pips >= 25.0:
-        base_limit += 60  # Tambah ekstra 1 menit untuk cooling down whipsaw
-        
+        base_limit += 60
+
     if elapsed < base_limit:
-        return False, f"Multi-Entry: Jeda {int(base_limit - elapsed)}s lagi (Adaptive {mode})"
+        return False, f"Entry delay: wait {int(base_limit - elapsed)}s more ({mode} adaptive)"
     return True, "OK"
 
 
 def filter_profit_lock(open_positions: int, floating_pnl: float) -> FilterResult:
-    # Only block adding MORE positions (>= 2) while existing ones are in loss
-    if open_positions >= 2 and floating_pnl < -10.0:
-        return False, f"Profit-Lock: {open_positions} posisi sedang Loss (${floating_pnl:.2f})"
+    """
+    Prevent adding new positions while existing ones are in significant loss.
+
+    Thresholds are mode-aware:
+      Conservative / Moderate : block if >= 1 open trade and floating PnL < -$5
+      Aggressive               : block if >= 3 open trades and floating PnL < -$20
+      Very Aggressive / Ultra  : block if >= 4 open trades and floating PnL < -$50
+                                 (risk already capped by equity-tier lot caps)
+
+    Small floating losses (below threshold) are counted in total_risk monitoring
+    but do NOT block new entries — consistent with 'always calculate risk even
+    for small negatives' requirement.
+    """
+    mode = TRADING_CONFIG.current_mode
+
+    if mode in (TradeMode.ULTRA_SCALPER, TradeMode.VERY_AGGRESSIVE):
+        min_positions = 4
+        loss_threshold = -50.0
+    elif mode == TradeMode.AGGRESSIVE:
+        min_positions = 3
+        loss_threshold = -20.0
+    else:  # CONSERVATIVE / MODERATE
+        min_positions = 1
+        loss_threshold = -5.0
+
+    if open_positions >= min_positions and floating_pnl < loss_threshold:
+        return False, (
+            f"Profit-lock: {open_positions} open positions with "
+            f"${floating_pnl:.2f} floating loss (threshold ${loss_threshold:.0f})"
+        )
     return True, "OK"
 
 
@@ -170,26 +212,31 @@ def filter_weekly_open(
 ) -> FilterResult:
     """
     No.77 — Weekly Open Trend Filter.
-    Jika harga di bawah weekly open → larang buy.
-    Jika harga di atas weekly open → larang sell.
-    Hanya berlaku untuk Conservative & Moderate (agresif boleh lawan).
+    Price below weekly open -> block buy.
+    Price above weekly open -> block sell.
+    Only applied to Conservative & Moderate; aggressive modes bypass this filter.
     """
     mode = TRADING_CONFIG.current_mode
-    from config.trading_config import TradeMode
-    if mode in (TradeMode.ULTRA_SCALPER, TradeMode.VERY_AGGRESSIVE):
-        return True, "OK"  # Aggressive modes skip this filter
+    if mode in (TradeMode.ULTRA_SCALPER, TradeMode.VERY_AGGRESSIVE, TradeMode.AGGRESSIVE):
+        return True, "OK"  # Aggressive modes skip weekly filter
 
     if weekly_open is None or weekly_open <= 0:
-        return True, "OK"  # No data, skip
+        return True, "OK"  # No data available
 
     if direction == "buy" and current_price < weekly_open:
         diff = (weekly_open - current_price) / 0.1
         if diff > 50:  # Only reject if meaningfully below (> 50 pips)
-            return False, f"Weekly Open Filter: Price {current_price:.2f} below weekly open {weekly_open:.2f} ({diff:.0f} pip)"
+            return False, (
+                f"Weekly open filter (No.77): price {current_price:.2f} is "
+                f"{diff:.0f} pips below weekly open {weekly_open:.2f}"
+            )
     elif direction == "sell" and current_price > weekly_open:
         diff = (current_price - weekly_open) / 0.1
         if diff > 50:
-            return False, f"Weekly Open Filter: Price {current_price:.2f} above weekly open {weekly_open:.2f} ({diff:.0f} pip)"
+            return False, (
+                f"Weekly open filter (No.77): price {current_price:.2f} is "
+                f"{diff:.0f} pips above weekly open {weekly_open:.2f}"
+            )
 
     return True, "OK"
 
@@ -202,8 +249,8 @@ def filter_daily_exhaustion(
 ) -> FilterResult:
     """
     No.98 — Daily Limit Capacity Exhaustion.
-    Jika Gold sudah lari > 330 pips searah dalam satu hari,
-    kemungkinan besar akan mean revert → LARANG entry searah tren, dorong ke reversal.
+    If gold has moved > 330 pips in one direction today, mean reversion is
+    likely — block same-direction entries and favour counter-trend.
     """
     if daily_high is None or daily_low is None:
         return True, "OK"
@@ -211,10 +258,8 @@ def filter_daily_exhaustion(
     daily_range_pips = (daily_high - daily_low) / 0.1
 
     if daily_range_pips < _DAILY_EXHAUSTION_PIPS:
-        return True, "OK"  # Range hasn't exhausted yet
+        return True, "OK"
 
-    # Determine dominant daily direction
-    # If price is near the high → daily went up → warn against buy
     range_size = daily_high - daily_low
     if range_size <= 0:
         return True, "OK"
@@ -223,13 +268,13 @@ def filter_daily_exhaustion(
 
     if direction == "buy" and price_pct_in_range > 0.75:
         return False, (
-            f"Daily Exhaustion (No.98): Gold ran {daily_range_pips:.0f} pips today, "
-            f"price at {price_pct_in_range*100:.0f}% of daily range — expect mean reversion"
+            f"Daily exhaustion (No.98): gold ran {daily_range_pips:.0f} pips today, "
+            f"price at {price_pct_in_range*100:.0f}% of range — mean reversion expected"
         )
     elif direction == "sell" and price_pct_in_range < 0.25:
         return False, (
-            f"Daily Exhaustion (No.98): Gold ran {daily_range_pips:.0f} pips today, "
-            f"price at {price_pct_in_range*100:.0f}% of daily range — expect mean reversion"
+            f"Daily exhaustion (No.98): gold ran {daily_range_pips:.0f} pips today, "
+            f"price at {price_pct_in_range*100:.0f}% of range — mean reversion expected"
         )
 
     return True, "OK"
@@ -241,13 +286,12 @@ def filter_choppiness(
 ) -> FilterResult:
     """
     No.23 — Choppiness Index Filter (simplified).
-    Market choppy jika daily range / ATR ratio < 1.5 (bergerak kurang dari 1.5x ATR).
-    Hanya untuk Conservative & Moderate agar tidak over-filter Aggressive modes.
+    Market is choppy when daily range / ATR < 1.5 (moves less than 1.5x ATR).
+    Only applied to Conservative & Moderate — aggressive modes can trade ranging markets.
     """
     mode = TRADING_CONFIG.current_mode
-    from config.trading_config import TradeMode
     if mode in (TradeMode.ULTRA_SCALPER, TradeMode.VERY_AGGRESSIVE, TradeMode.AGGRESSIVE):
-        return True, "OK"
+        return True, "OK"  # Aggressive modes bypass — Pulse handles sideways
 
     if atr_pips <= 0:
         return True, "OK"
@@ -255,7 +299,10 @@ def filter_choppiness(
     choppiness_ratio = daily_range_pips / atr_pips if atr_pips > 0 else 5.0
 
     if choppiness_ratio < 1.5:
-        return False, f"Choppiness Filter (No.23): Market choppy (daily range/ATR = {choppiness_ratio:.1f} < 1.5)"
+        return False, (
+            f"Choppiness filter (No.23): market too choppy "
+            f"(daily range/ATR = {choppiness_ratio:.1f} < 1.5)"
+        )
 
     return True, "OK"
 
@@ -279,7 +326,8 @@ def run_all_filters(
     last_trade_opened_at: Optional[datetime] = None,
     current_floating_pnl: float = 0.0,
     signal_type: str = "REGULAR",
-    # Smart context params (Phase 2)
+    cutloss_triggered: bool = False,
+    # Smart context params
     direction: str = "",
     weekly_open: Optional[float] = None,
     current_price: float = 0.0,
@@ -287,8 +335,13 @@ def run_all_filters(
     daily_low: Optional[float] = None,
 ) -> tuple[bool, list]:
     """
-    Run all filters and return (all_passed, list_of_failures).
+    Run all pre-trade filters and return (all_passed, list_of_failure_reasons).
+    daily_pnl is kept for legacy callers; realized-loss check uses it as realized PnL.
     """
+    # Hard cutloss gate — checked first, blocks all new entries for the rest of the day
+    if cutloss_triggered:
+        return False, ["Hard cutloss triggered — trading halted for today"]
+
     checks = [
         filter_spread(spread_pips),
         filter_session(dt),
@@ -301,7 +354,7 @@ def run_all_filters(
         filter_news(news_active),
     ]
 
-    # Pulse scalper intentionally bypasses these specific limiters for rapid re-entry
+    # Pulse scalper bypasses rate-limit filters for rapid re-entry capability
     if signal_type != "PULSE":
         checks.extend([
             filter_concurrent_positions(open_positions),
@@ -310,12 +363,11 @@ def run_all_filters(
             filter_profit_lock(open_positions, current_floating_pnl),
         ])
 
-        # Smart Context Filters (Phase 2 additions) — REGULAR signals only
+        # Smart context filters — regular signals only
         if direction and current_price > 0:
             checks.append(filter_weekly_open(direction, weekly_open, current_price))
             checks.append(filter_daily_exhaustion(direction, daily_high, daily_low, current_price))
 
-            # Choppiness: compute daily range pips from high/low if available
             if daily_high is not None and daily_low is not None and atr_pips > 0:
                 daily_range_pips = (daily_high - daily_low) / 0.1
                 checks.append(filter_choppiness(daily_range_pips, atr_pips))
@@ -324,4 +376,3 @@ def run_all_filters(
     if failures:
         logger.debug(f"Filter failures: {failures}")
     return len(failures) == 0, failures
-

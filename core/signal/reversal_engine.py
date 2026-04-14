@@ -1,25 +1,24 @@
 """
 Reversal & Spike-Retest Engine.
 
-Logika spesifik untuk dua skenario:
-  1. SPIKE-DOWN → tunggu → RETEST (Wyckoff Spring / Post-Impulse Retest)
-  2. SPIKE-DOWN → stabil → NAIK PERLAHAN → entry buy (Exhaustion Recovery)
+Two specific reversal scenarios:
+  1. SPIKE-DOWN -> wait -> RETEST (Wyckoff Spring / Post-Impulse Retest)
+  2. SPIKE-DOWN -> stabilise -> SLOW RECOVERY -> buy entry (Exhaustion Recovery)
 
-Kondisi:
-  - Deteksi "Impulse Bar" (candle body > 2x ATR)
-  - Set WAIT mode selama N candle setelah impulse
-  - Entry saat harga retest 50-61.8% zona impulsif ATAU 2 candle konfirmasi balik arah
+Conditions:
+  - Detect "Impulse Bar" (candle body > 2x ATR)
+  - Enter WAIT mode for N candles after the impulse
+  - Entry when price retests 38–61.8% Fibonacci zone OR after N reversal candles
 
-Komponen:
-  - ImpulseRetestEngine: state machine untuk mengelola wait → entry
-  - Consecutive Candle Fade: 7+ candle searah → reversal setup
+Components:
+  - ImpulseRetestEngine: state machine managing WATCHING -> WAITING -> READY
+  - Consecutive Candle Fade: 7+ same-direction candles -> reversal setup
 
 Strategy references:
   - Plan No.11 Consecutive Candle Fade
   - Plan No.33 Wyckoff Spring Detection (adapted)
   - Plan No.35 Z-Score MA Revert
   - Plan No.65 MACD Histogram Acceleration
-  - Skenario user: "volatile turun kencang → retest / naik perlahan"
 """
 from __future__ import annotations
 import uuid
@@ -47,17 +46,17 @@ CONSECUTIVE_FADE_THRESH  = 7     # No.11: N candles same direction triggers fade
 MACH_SHRINK_COUNT        = 3     # No.65: N bars of MACD hist shrinking triggers
 MACH_SHRINK_COUNT        = 3     # keep alias
 MACD_SHRINK_COUNT        = 3
-RECOVERY_ATR_RATIO       = 1.2   # No.2 skenario: ATR cools below ratio → entry ok
-RECOVERY_MIN_BARS        = 3     # minimum recovery bars needed (perlahan naik)
+RECOVERY_ATR_RATIO       = 1.2   # Scenario 2: ATR must cool below this ratio for entry
+RECOVERY_MIN_BARS        = 3     # minimum recovery bars required (slow ascending close series)
 
 # ── Session-specific overrides ────────────────────────────────────────────────
 _SESSION_PARAMS = {
     # (confirm_candles, rr_mult_retest, rr_mult_fade, sl_atr_factor, fade_thresh)
-    "OVERLAP": (4, 3.5, 2.5, 0.6, 9),   # 12-16 UTC: paling liar, butuh 4 konfirmasi
-    "NY":      (3, 3.0, 2.0, 0.5, 8),   # 13-21 UTC: volatile, 3 konfirmasi
-    "LONDON":  (2, 2.5, 1.8, 0.4, 7),   # 07-16 UTC: aktif tapi terstruktur
-    "ASIA":    (2, 2.0, 1.5, 0.3, 6),   # 00-09 UTC: tenang, agresif OK
-    "DEFAULT": (2, 2.5, 1.7, 0.4, 7),   # transisi / late US
+    "OVERLAP": (4, 3.5, 2.5, 0.6, 9),   # 12-16 UTC: most volatile — requires 4 confirmations
+    "NY":      (3, 3.0, 2.0, 0.5, 8),   # 13-21 UTC: volatile — 3 confirmations
+    "LONDON":  (2, 2.5, 1.8, 0.4, 7),   # 07-16 UTC: active but structured
+    "ASIA":    (2, 2.0, 1.5, 0.3, 6),   # 00-09 UTC: quiet — more aggressive entries OK
+    "DEFAULT": (2, 2.5, 1.7, 0.4, 7),   # transition / late US
 }
 
 
@@ -76,9 +75,9 @@ class ImpulseEvent:
 
 class ImpulseRetestEngine:
     """
-    State machine yang mendeteksi spike besar kemudian mengelola
-    timing entry untuk retest atau recovery.
-    
+    State machine that detects large impulse spikes and manages
+    entry timing for retest or exhaustion-recovery setups.
+
     State: WATCHING → WAITING → READY_TO_ENTER → RESET
     """
 
@@ -100,7 +99,7 @@ class ImpulseRetestEngine:
         based on current UTC session.
         """
         hour = utc_now().hour
-        if 12 <= hour < 16:   return _SESSION_PARAMS["OVERLAP"]  # paling brutal
+        if 12 <= hour < 16:   return _SESSION_PARAMS["OVERLAP"]  # most brutal session
         if 13 <= hour < 21:   return _SESSION_PARAMS["NY"]
         if 7  <= hour < 16:   return _SESSION_PARAMS["LONDON"]
         if 0  <= hour < 9:    return _SESSION_PARAMS["ASIA"]
@@ -143,7 +142,7 @@ class ImpulseRetestEngine:
         if len(df_m1) < 50 or len(df_m5) < 30:
             return None
 
-        # Spread guard — lebih ketat di NY (spread lebih lebar)
+        # Spread guard — tighter during NY/Overlap where spread widens
         max_spread = 4.0 if (is_ny_session or is_overlap) else 3.0
         if current_spread_pips > max_spread:
             return None
@@ -168,9 +167,9 @@ class ImpulseRetestEngine:
         sl_atr_factor: float = 0.3,
     ) -> Optional[TradeSignal]:
         """
-        Deteksi: candle impulsif besar (>2x ATR) → tunggu → masuk saat
-        harga retest ke zona Fibonacci 38-61.8% dari range impulsif.
-        SL: di luar impulse (beyond spike extreme).
+        Detect a large impulse candle (>2x ATR), wait, then enter when
+        price retests the 38–61.8% Fibonacci zone of the impulse range.
+        SL: beyond the spike extreme.
         """
         closes = df_m1["close"]
         highs  = df_m1["high"]
@@ -282,7 +281,7 @@ class ImpulseRetestEngine:
             score_bonus=3,
         )
 
-    # ── Strategy 2: Exhaustion Recovery (Naik Perlahan) ──────────────────────
+    # ── Strategy 2: Exhaustion Recovery (Slow Climb) ─────────────────────────
 
     def _check_exhaustion_recovery(
         self,
@@ -291,13 +290,13 @@ class ImpulseRetestEngine:
         confirm_candles: int = RECOVERY_MIN_BARS,
     ) -> Optional[TradeSignal]:
         """
-        Skenario 2: Setelah spike turun kencang, volatility mereda (ATR turun),
-        lalu harga naik perlahan RECOVERY_MIN_BARS candle → entry buy.
-        
-        Kondisi:
-          - Ada impulse down dalam 10 bar terakhir
-          - ATR M1 sekarang < 1.2x ATR normal (mereda)
-          - Minimal 3 bar terakhir close makin naik (series ascending closes)
+        Scenario 2: After a sharp spike down, volatility cools (ATR drops),
+        then price climbs slowly for RECOVERY_MIN_BARS candles → buy entry.
+
+        Conditions:
+          - Impulse-down candle within the last 10 bars
+          - M1 ATR is now < 1.2x baseline ATR (volatility cooled)
+          - Last N closes form an ascending series
         """
         closes = df_m1["close"]
         lows   = df_m1["low"]
@@ -385,9 +384,9 @@ class ImpulseRetestEngine:
         fade_thresh: int = CONSECUTIVE_FADE_THRESH,
     ) -> Optional[TradeSignal]:
         """
-        No.11: Jika ada N candle berturut-turut satu arah (body valid, bukan doji),
-        counter-entry berlawanan dengan SL tipis di luar extreme candle terakhir.
-        Logic: momentum exhaustion → harga cenderung koreksi setelah run panjang.
+        No.11: When N consecutive candles run in the same direction (valid body, no doji),
+        take a counter-entry with a tight SL just beyond the streak's extreme.
+        Logic: momentum exhaustion — price tends to correct after a long directional run.
         """
         closes = df_m1["close"]
         opens  = df_m1["open"]
@@ -461,10 +460,10 @@ class ImpulseRetestEngine:
         rr_mult: float = 1.8,
     ) -> Optional[TradeSignal]:
         """
-        No.65: MACD histogram ciut/mengecil N kali berturut-turut →
-        momentum melemah → masuk pada konfirmasi arah balikan.
-        
-        Hanya fire jika H1 bias tidak bertentangan kuat.
+        No.65: MACD histogram shrinks N consecutive bars →
+        momentum weakening → enter in the reversal direction.
+
+        Only fires when H1 bias does not strongly oppose the entry direction.
         """
         if len(df_m5) < 40:
             return None

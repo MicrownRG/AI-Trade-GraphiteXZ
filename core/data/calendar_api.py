@@ -36,22 +36,30 @@ class CalendarAPI:
     def is_news_active(self, events: List[Dict], window_minutes: int = 30) -> bool:
         """
         Checks if any high-impact event is within the window from now.
-        Feed 'time' format: "March 15, 2026 12:30pm" (example)
+        Feed 'time' format: ISO8601 (e.g. '2026-04-13T08:30:00-04:00')
         """
         if not events:
             return False
 
         now = datetime.now(timezone.utc)
         for e in events:
-            event_time_str = f"{e.get('date')} {e.get('time')}"
             try:
-                # Common format: "March 15, 2026 12:30pm"
-                # Some feeds might differ, adjust parsing if needed
-                event_dt = datetime.strptime(event_time_str, "%B %d, %Y %I:%M%p")
-                
+                # Some feeds provide standard ISO datetime with timezone
+                date_str = str(e.get('time', ''))
+                if not date_str:
+                    continue
+                    
+                # Support standard ISO format decoding
+                event_dt = datetime.fromisoformat(date_str)
+                # Convert to UTC if needed
+                if event_dt.tzinfo is None:
+                    event_dt = event_dt.replace(tzinfo=timezone.utc)
+                else:
+                    event_dt = event_dt.astimezone(timezone.utc)
+                    
                 diff = abs((event_dt - now).total_seconds()) / 60
                 if diff <= window_minutes:
                     return True
-            except:
+            except Exception:
                 continue
         return False

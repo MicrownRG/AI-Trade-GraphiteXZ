@@ -63,8 +63,8 @@ def calculate_take_profit(
     # Calculate ambitious mathematical TP2
     math_tp2 = entry_price + risk * rr if direction == "buy" else entry_price - risk * rr
 
-    # ── OPTIMIZATION: Jangan maksa TP jauh! ──
-    # Jika ada resistance/support terdekat yang jaraknya masuk akal (RR > 0.8), ambil itu sebagai TP Utama!
+    # ── OPTIMIZATION: Don't force TP far away ──
+    # If a nearby resistance/support is reachable at RR > 0.8, use it as TP2 instead.
     if structure_tp is not None:
         struct_risk = abs(structure_tp - entry_price)
         struct_rr = struct_risk / risk if risk > 0 else 0

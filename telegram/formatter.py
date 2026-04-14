@@ -103,16 +103,16 @@ def fmt_stalking_signal(
     tp: float,
     mode: str,
 ) -> str:
-    """Format a 'Pantau' (Stalking) radar notification."""
+    """Format a stalking / watching radar notification."""
     rr = abs(tp - price) / abs(sl - price) if abs(sl - price) > 0 else 0
     return (
-        f"📡 *RADAR: SETUP PANTAU*\n"
+        f"📡 *RADAR: WATCHING SETUP*\n"
         f"{'─' * 18}\n"
         f"*{_dir_emoji(direction)}*  `{price:.2f}`\n\n"
-        f"📊 Skor:    `{score}/{max_score}`\n"
+        f"📊 Score:   `{score}/{max_score}`\n"
         f"🛡 Mode:    `{_escape(mode)}`\n"
         f"📐 Pot. RR: `1:{rr:.2f}`\n\n"
-        f"📝 *Status:* \n"
+        f"📝 *Status:*\n"
         f"_{_escape(reason)}_\n\n"
         f"🕐 {_wib(datetime.now(timezone.utc))}\n"
         f"⚠️ _Pending entry, waiting for extreme retracement\\._"
@@ -319,7 +319,7 @@ def fmt_signal_scan(
         f"",
         f"📊 Score  `{score}/{threshold}` \\({_escape(mode)}\\)",
         f"📈 Bias   `{_escape(bias)}`",
-        f"📉 Arah   `{_escape(direction.upper())}`",
+        f"📉 Dir    `{_escape(direction.upper())}`",
         f"",
         f"*Score Breakdown:*",
     ]
@@ -394,6 +394,8 @@ def fmt_status(
     current_mode: str = "UNKNOWN",
     ai_enabled: bool = True,
     pulse_suspended: bool = False,
+    cutloss_triggered: bool = False,
+    realized_loss_pct: float = 0.0,
 ) -> str:
     if is_paused:
         resume_str = f"\\| resume {_wib(resume_at)}" if resume_at else ""
@@ -405,10 +407,13 @@ def fmt_status(
 
     realized_sign = "\\+" if realized_pnl >= 0 else "\\-"
     floating_sign = "\\+" if floating_pnl >= 0 else "\\-"
-    
     total_sign = "\\+" if total_pnl >= 0 else "\\-"
-    
-    pulse_status_str = f"\n🔌 Pulse Scalp: `SUSPENDED` (3x Loss Guard)" if pulse_suspended else ""
+
+    pulse_status_str = f"\n🔌 Pulse Scalp: `SUSPENDED` \\(3x Loss Guard\\)" if pulse_suspended else ""
+    cutloss_str = (
+        f"\n🔴 *HARD CUTLOSS ACTIVE* — realized loss `{realized_loss_pct:.1f}%`\\. Trading halted\\."
+        if cutloss_triggered else ""
+    )
 
     return (
         f"🤖 *BOT STATUS*\n"
@@ -418,12 +423,12 @@ def fmt_status(
         f"💰 Balance:  `${balance:.2f}`\n"
         f"📊 Equity:   `${equity:.2f}`\n"
         f"📉 Drawdown: `{drawdown_pct:.2f}%`\n\n"
-        f"✅ *Today Released PnL*: `{realized_sign}${abs(realized_pnl):.2f}`\n"
+        f"✅ *Today Realized PnL*: `{realized_sign}${abs(realized_pnl):.2f}`\n"
         f"📈 *Floating*:           `{floating_sign}${abs(floating_pnl):.2f}`\n"
         f"📊 *Total Today PnL*:    `{total_sign}${abs(total_pnl):.2f}`\n\n"
         f"📂 Open:     `{open_trades}` positions\n"
         f"🔢 Today:    `{trades_today}` trades\n"
-        f"🤖 AI:       `{_escape(active_provider)}` \\({'ON' if ai_enabled else 'OFF'}\\){pulse_status_str}\n\n"
+        f"🤖 AI:       `{_escape(active_provider)}` \\({'ON' if ai_enabled else 'OFF'}\\){pulse_status_str}{cutloss_str}\n\n"
         f"🕐 {_wib(checked_at)}"
     )
 
@@ -453,7 +458,8 @@ def fmt_help() -> str:
         "/pause \\[minutes\\] — pause bot \\(default 60 min\\)\n"
         "/resume — resume immediately\n"
         "/reset — cooldown management menu\n"
-        "/pulse — manually reset pulse scalper guard\n\n"
+        "/pulse — manually reset pulse scalper guard\n"
+        "/adapter — toggle AI adaptive learning engine\n\n"
         "*ℹ️ Info*\n"
         "/balance — quick balance check\n"
         "/help — show this menu"
