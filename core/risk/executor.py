@@ -82,7 +82,8 @@ class RiskExecutor:
                 f"Low margin for {session_name} session: {margin_level:.1f}% (need > {min_margin:.0f}%)"
             )
 
-        is_pulse = "PULSE" in signal.signal_id
+        is_pulse       = "PULSE" in signal.signal_id
+        is_contra_flip = signal.signal_id.startswith("FLIP_")
 
         if is_pulse:
             # Pulse trades supply their own tight SL/TP
@@ -99,7 +100,8 @@ class RiskExecutor:
                 lot_size = 0.01
 
         else:
-            if getattr(signal, "is_extreme", False):
+            if getattr(signal, "is_extreme", False) or is_contra_flip:
+                # Contra-flip SL is pre-calculated (ATR-based); don't overwrite it.
                 sl = signal.stop_loss
             else:
                 # Calculate SL from market structure using M15 for reliability
@@ -173,8 +175,34 @@ class RiskExecutor:
         total_cap, _ = get_equity_lot_caps(
             safe_balance, strategy=signal.signal_id, session_name=session_name
         )
-        current_open_lots = sum(t["lot_size"] for t in pf.open_trades.values())
+        # Only trades that are NOT yet SL+/micro-locked consume the portfolio cap.
+        # Once a trade has ratcheted its SL to breakeven+ (micro_locked or
+        # be_activated), it can no longer produce a loss, so it's treated as
+        # "safe" and freed from the cap — letting the bot stack a fresh batch
+        # up to total_cap again.  Each new batch must also reach SL+ before
+        # the NEXT batch can open (staircase scaling).
+        at_risk_lots = sum(
+            t["lot_size"]
+            for t in pf.open_trades.values()
+            if not (t.get("be_activated") or t.get("micro_locked"))
+        )
+        safe_lots         = sum(t["lot_size"] for t in pf.open_trades.values()) - at_risk_lots
+        current_open_lots = at_risk_lots
         remaining_cap     = max(0.0, total_cap - current_open_lots)
+
+        # Hard reject if all currently-at-risk lots already fill the cap.
+        if remaining_cap < RISK_CONFIG.min_lot_size:
+            return self._reject(
+                signal,
+                f"Portfolio cap reached: at_risk={at_risk_lots:.2f} "
+                f"safe_SL+={safe_lots:.2f} cap={total_cap:.2f} "
+                f"(need SL+ on at-risk batch first)",
+            )
+        if safe_lots > 0:
+            logger.info(
+                f"Cap freed by SL+ batch: safe={safe_lots:.2f} "
+                f"at_risk={at_risk_lots:.2f} new_cap_avail={remaining_cap:.2f}"
+            )
 
         if lot_size > remaining_cap:
             logger.info(
@@ -202,7 +230,7 @@ class RiskExecutor:
         open_positions        = list(pf.open_trades.values())
         same_direction_count  = len([
             t for t in open_positions
-            if t.get("symbol", signal.symbol) == signal.symbol and t["direction"] == signal.direction
+            if t.get("symbol", signal.symbol) == signal.symbol and t.get("direction") == signal.direction
         ])
 
         mode = TRADING_CONFIG.current_mode
@@ -258,7 +286,7 @@ class RiskExecutor:
             last_trade_result_pnl  = pf.last_trade_result_pnl,
             last_trade_opened_at   = pf.last_trade_opened_at,
             current_floating_pnl   = pf.current_floating_pnl,
-            signal_type            = "PULSE" if is_pulse else "REGULAR",
+            signal_type            = "PULSE" if is_pulse else ("CONTRA_FLIP" if is_contra_flip else "REGULAR"),
             cutloss_triggered      = pf.daily_cutloss_triggered,
         )
 

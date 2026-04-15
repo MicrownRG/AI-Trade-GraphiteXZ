@@ -63,30 +63,69 @@ def fmt_trade_entry(
     ai_reason: Optional[str] = None,
     opened_at: datetime = None,
     strategy: str = "",
+    signal_id: str = "",
+    max_score: int = 10,
+    score_breakdown: Optional[dict] = None,
+    mtf_summary: str = "",
+    htf_bias: str = "",
+    tp_source: str = "",   # "FIBO_H1_127.2%" / "SESSION_RR_4.0x" / etc
+    sl_source: str = "",   # "M1_OB" / "M5_FVG" / "ATR_FALLBACK"
 ) -> str:
     sl_pips  = abs(entry_price - stop_loss) / 0.1
     tp_pips  = abs(take_profit - entry_price) / 0.1
     rr       = tp_pips / sl_pips if sl_pips > 0 else 0
 
     strategy_label = f"⚙️ Strategy  `{_escape(strategy)}`\n" if strategy else ""
+    sigid_label    = f" `{_escape(signal_id)}`" if signal_id else ""
+
+    # Signal-type label from signal_id prefix
+    sig_type = "SMC"
+    if signal_id.startswith("FIBO"):    sig_type = "📐 Fibo MTF"
+    elif signal_id.startswith("PULSE"): sig_type = "⚡ Pulse"
+    elif signal_id.startswith("REV"):   sig_type = "🔄 Reversal"
+    elif signal_id.startswith("SMC"):   sig_type = "🛡️ SMC"
 
     msg = (
-        f"🚀 *TRADE ENTERED*\n"
+        f"🚀 *TRADE ENTERED*{sigid_label}\n"
         f"{'─' * 15}\n"
-        f"*{_dir_emoji(direction)}*  `{entry_price:.2f}`\n\n"
+        f"*{_dir_emoji(direction)}*  `{entry_price:.2f}`\n"
+        f"🏷 Type      `{_escape(sig_type)}`\n"
         f"{strategy_label}"
         f"🎯 TP    `{take_profit:.2f}`  \\(\\+{tp_pips:.0f} pips\\)\n"
-        f"🛑 SL    `{stop_loss:.2f}`  \\(\\-{sl_pips:.0f} pips\\)\n"
+    )
+    if tp_source:
+        msg += f"   └ _TP source:_ `{_escape(tp_source)}`\n"
+    msg += f"🛑 SL    `{stop_loss:.2f}`  \\(\\-{sl_pips:.0f} pips\\)\n"
+    if sl_source:
+        msg += f"   └ _SL source:_ `{_escape(sl_source)}`\n"
+    msg += (
         f"📐 RR    `1:{rr:.2f}`\n\n"
         f"📦 Lot       `{lot_size}`\n"
         f"💸 Risk      `${risk_amount:.2f}`  \\({risk_pct:.2f}%\\)\n"
-        f"📊 Score     `{signal_score}/10`\n"
+        f"📊 Score     `{signal_score}/{max_score}`\n"
+        f"🕓 Session   `{_escape(session)}`\n"
     )
+    if htf_bias:
+        msg += f"🧭 HTF Bias  `{_escape(htf_bias)}`\n"
+
+    # Multi-TF summary line (H4:BUL | H1:BUL | M15:NEU* | …)
+    if mtf_summary:
+        msg += f"\n*Multi\\-TF:*\n`{_escape(mtf_summary)}`\n"
+        msg += "_Legend: `!` rejection, `*` OB zone, `φ` Fibo golden_\n"
+
+    # Score composition breakdown
+    if score_breakdown:
+        msg += "\n*Score Composition:*\n"
+        for k, v in score_breakdown.items():
+            if v != 0:
+                key_label = _escape(k.replace("_", " ").title())
+                sign = "\\+" if v > 0 else "\\-"
+                msg += f"  • {key_label}: `{sign}{abs(v)}`\n"
 
     if ai_confidence is not None:
-        msg += f"🤖 AI Conf   `{ai_confidence:.0%}`\n"
+        msg += f"\n🤖 AI Conf   `{ai_confidence:.0%}`\n"
     if ai_reason:
-        msg += f"💬 _{_escape(ai_reason[:120])}_\n"
+        msg += f"💬 _{_escape(ai_reason[:160])}_\n"
 
     msg += f"\n🕐 {_wib(opened_at or datetime.now(timezone.utc))}\n"
     msg += f"🆔 `{trade_id}`"
@@ -443,6 +482,7 @@ def fmt_help() -> str:
         "/pnl — P\\&L summary this week\n"
         "/status — bot state, balance, drawdown\n"
         "/positions — list all active positions\n"
+        "/backtest — run backtest\n"
         "/eod — generate AI Daily Retrospective\n\n"
         "*⚙️ Config & Trade*\n"
         "/mode — change risk level \\(Ultra, Moderate, etc\\)\n"
@@ -576,7 +616,7 @@ def fmt_positions_list(
         elif "REV" in str(t.get("signal_id", "")):
             type_label = "🔄 Reversal"
         else:
-            type_label = "🛡️ ICT Standard"
+            type_label = "🛡️ SMC Standard"
         
         sign = "\\+" if pnl >= 0 else "\\-"
         

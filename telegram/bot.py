@@ -158,27 +158,41 @@ class TelegramBot:
         ai_reason:    str,
         opened_at:    Optional[datetime] = None,
         strategy:     str = "",
+        signal_id:    str = "",
+        max_score:    int = 10,
+        score_breakdown: Optional[dict] = None,
+        mtf_summary:  str = "",
+        htf_bias:     str = "",
+        tp_source:    str = "",
+        sl_source:    str = "",
     ) -> None:
         # Loop over all allowed users to send tailored message
         for chat_id in self.cmd_handler.allowed:
             prefers_full = self.user_prefs.get(chat_id, False)
-            
+
             self.notifier.send(
                 fmt_trade_entry(
-                    trade_id     = trade_id,
-                    direction    = direction,
-                    entry_price  = entry_price,
-                    stop_loss    = stop_loss,
-                    take_profit  = take_profit,
-                    lot_size     = lot_size,
-                    risk_amount  = risk_amount,
-                    risk_pct     = risk_pct,
-                    signal_score = signal_score,
-                    session      = session,
-                    ai_confidence= ai_confidence if prefers_full else None,
-                    ai_reason    = ai_reason if prefers_full else None,
-                    opened_at    = opened_at or datetime.now(timezone.utc),
-                    strategy     = strategy,
+                    trade_id        = trade_id,
+                    direction       = direction,
+                    entry_price     = entry_price,
+                    stop_loss       = stop_loss,
+                    take_profit     = take_profit,
+                    lot_size        = lot_size,
+                    risk_amount     = risk_amount,
+                    risk_pct        = risk_pct,
+                    signal_score    = signal_score,
+                    session         = session,
+                    ai_confidence   = ai_confidence if prefers_full else None,
+                    ai_reason       = ai_reason if prefers_full else None,
+                    opened_at       = opened_at or datetime.now(timezone.utc),
+                    strategy        = strategy,
+                    signal_id       = signal_id,
+                    max_score       = max_score,
+                    score_breakdown = score_breakdown if prefers_full else None,
+                    mtf_summary     = mtf_summary,
+                    htf_bias        = htf_bias,
+                    tp_source       = tp_source,
+                    sl_source       = sl_source,
                 ),
                 chat_id = chat_id
             )
@@ -274,6 +288,17 @@ class TelegramBot:
         """Broadcasts a generic system alert to all allowed chats."""
         for chat_id in self.cmd_handler.allowed:
             self.notifier.send(message, chat_id=chat_id)
+
+    def send_message(self, message: str, parse_mode: Optional[str] = None) -> None:
+        """
+        Alias used by order_manager / core modules.
+        Defaults to plain text (empty parse_mode) so callers don't need to
+        escape MarkdownV2 specials. Callers that WANT formatting should
+        pass parse_mode="MarkdownV2" explicitly AND pre-escape.
+        """
+        pm = parse_mode if parse_mode else ""   # "" disables Telegram parsing
+        for chat_id in self.cmd_handler.allowed:
+            self.notifier.send(message, parse_mode=pm, chat_id=chat_id)
 
     def notify_stalking_setup(self, signal: TradeSignal, mode_label: str) -> None:
         """Sends a radar 'Pantau' alert with a 30-minute cooldown."""

@@ -67,7 +67,8 @@ TF_TTL = {
 
 class TFTrend:
     """Trend result for a single timeframe."""
-    __slots__ = ("tf", "bias", "adx", "ema_cross", "weight", "score", "at_zone", "rejection")
+    __slots__ = ("tf", "bias", "adx", "ema_cross", "weight", "score",
+                 "at_zone", "rejection", "fibo_golden", "fibo_retrace_pct")
 
     def __init__(
         self,
@@ -77,6 +78,8 @@ class TFTrend:
         ema_cross: bool,
         at_zone: str = "NONE",
         rejection: str = "NONE",
+        fibo_golden: str = "NONE",      # "BULLISH" | "BEARISH" | "NONE"
+        fibo_retrace_pct: float = 0.0,  # current retrace %
     ):
         self.tf        = tf
         self.bias      = bias       # "BULLISH" | "BEARISH" | "NEUTRAL"
@@ -84,6 +87,8 @@ class TFTrend:
         self.ema_cross = ema_cross
         self.at_zone   = at_zone    # "BULLISH_OB" | "BEARISH_OB" | "NONE"
         self.rejection = rejection  # "BULLISH" | "BEARISH" | "NONE"
+        self.fibo_golden = fibo_golden
+        self.fibo_retrace_pct = fibo_retrace_pct
         self.weight    = TF_WEIGHTS.get(tf.lower(), 1)
 
         # Base score: weight * strength multiplier
@@ -98,6 +103,10 @@ class TFTrend:
         # Zone hit bonus (price at HTF OB/FVG)
         if at_zone != "NONE":
             self.score += self.weight * 0.5
+
+        # Fibo golden pocket bonus (price at 61.8–78.6% retracement aligned to bias)
+        if fibo_golden != "NONE" and fibo_golden == bias:
+            self.score += self.weight * 0.6
 
     def __repr__(self) -> str:
         return f"{self.tf.upper()}:{self.bias}(adx={self.adx:.0f})"
@@ -245,9 +254,11 @@ class MultiTFAnalysis:
                 continue
             item = f"{k.upper()}:{_short(v.bias)}"
             if v.rejection != "NONE":
-                item += "!"   # visual indicator for rejection wick
+                item += "!"   # rejection wick
             if v.at_zone != "NONE":
-                item += "*"   # visual indicator for zone hit
+                item += "*"   # OB/FVG zone hit
+            if v.fibo_golden != "NONE":
+                item += "φ"   # Fibo golden pocket (61.8-78.6%)
             parts.append(item)
 
         return (
@@ -274,6 +285,7 @@ class MultiTFAnalyzer:
         try:
             result = self.trend.analyze_trend(df)
             price  = float(df["close"].iloc[-1])
+            bias_current = result.get("bias", "NEUTRAL")
 
             # Detect HTF order-block zone hit
             obs     = self._smc.get_order_blocks(df)
@@ -286,13 +298,46 @@ class MultiTFAnalyzer:
                         at_zone = "BULLISH_OB" if ob["type"] == "BULLISH" else "BEARISH_OB"
                         break
 
+            # Fibo golden pocket detection (61.8–78.6% retrace aligned with bias)
+            fibo_golden = "NONE"
+            fibo_retrace_pct = 0.0
+            try:
+                from core.structure.swing import detect_swings
+                sw = detect_swings(df.tail(100))
+                highs = [s for s in sw if s.kind == 'high']
+                lows  = [s for s in sw if s.kind == 'low']
+                if highs and lows:
+                    sh = highs[-1]
+                    sl_pt = lows[-1]
+                    rng = sh.price - sl_pt.price
+                    if rng > 0.5:
+                        # Bullish setup: most recent low came AFTER high won't apply;
+                        # we use last swing as the impulse; price retracing into
+                        # golden pocket means continuation in bias direction.
+                        if sh.index > sl_pt.index:
+                            # Upswing: retrace measured downward from swing_high
+                            retrace = (sh.price - price) / rng
+                            if 0.618 <= retrace <= 0.786:
+                                fibo_golden = "BULLISH"
+                                fibo_retrace_pct = retrace
+                        else:
+                            # Downswing: retrace measured upward from swing_low
+                            retrace = (price - sl_pt.price) / rng
+                            if 0.618 <= retrace <= 0.786:
+                                fibo_golden = "BEARISH"
+                                fibo_retrace_pct = retrace
+            except Exception:
+                pass
+
             return TFTrend(
                 tf        = tf_name,
-                bias      = result.get("bias", "NEUTRAL"),
+                bias      = bias_current,
                 adx       = float(result.get("adx", 20.0)),
                 ema_cross = bool(result.get("ema_cross", False)),
                 at_zone   = at_zone,
                 rejection = result.get("rejection", "NONE"),
+                fibo_golden = fibo_golden,
+                fibo_retrace_pct = fibo_retrace_pct,
             )
         except Exception as e:
             logger.debug(f"MultiTF: failed to analyze {tf_name}: {e}")

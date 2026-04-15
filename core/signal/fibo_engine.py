@@ -9,10 +9,10 @@ Strategy:
          Tier B: Pin Bar only / weak engulfing           → half lot
          Reject: Doji / inside bar                       → skip
 
-Partial Close:
-  TP1 → Close 50%,  SL → BE (entry)
-  TP2 → Close 25%,  SL → TP1
-  TP3 → SL → TP2, recalc extension from H1 Fibo
+Partial Close (Fibo extension ladder — all TPs give RR ≥ 1.5):
+  TP1 = swing_high (100%)   → Close 50%, SL → BE (entry)    [RR ≈ 1.60]
+  TP2 = 127.2% extension    → Close 25%, SL → TP1           [RR ≈ 2.31]
+  TP3 = 161.8% extension    → Close 25%, SL → TP2            [RR ≈ 3.21]
 
 All levels are mathematically derived from Fibo — no guessing.
 """
@@ -247,19 +247,19 @@ def calculate_fibo_levels(
     lvl["ext161"] = swing_low + rng * FIBO_RATIOS["ext161"]  # 161.8%
 
     if direction == "buy":
-        entry       = swing_low  + rng * 0.382   # = 61.8% pullback from swing_high
+        entry       = swing_low  + rng * 0.382   # 61.8% retrace (golden pocket entry)
         stop_loss   = swing_low  - buf
-        tp1         = swing_low  + rng * 0.618   # = 38.2% pullback
-        tp2         = swing_high                  # = 0% pullback
-        tp3         = swing_high + rng * 0.272   # 127.2% ext
-        tp_ext      = swing_high + rng * 0.618   # 161.8% ext
+        tp1         = swing_high                  # 100% (complete retrace)  → RR ≈ 1.6
+        tp2         = swing_high + rng * 0.272   # 127.2% extension          → RR ≈ 2.3
+        tp3         = swing_high + rng * 0.618   # 161.8% golden extension   → RR ≈ 3.2
+        tp_ext      = swing_high + rng * 1.000   # 200% (ambitious stretch)
     else:  # sell
-        entry       = swing_high - rng * 0.382   # = 61.8% bounce from swing_low
+        entry       = swing_high - rng * 0.382   # 61.8% bounce (golden pocket short)
         stop_loss   = swing_high + buf
-        tp1         = swing_high - rng * 0.618   # = 38.2% bounce
-        tp2         = swing_low                   # = 0% bounce
-        tp3         = swing_low  - rng * 0.272   # 127.2% ext down
-        tp_ext      = swing_low  - rng * 0.618   # 161.8% ext down
+        tp1         = swing_low                   # 100% (complete bounce)
+        tp2         = swing_low  - rng * 0.272   # 127.2% extension down
+        tp3         = swing_low  - rng * 0.618   # 161.8% golden extension down
+        tp_ext      = swing_low  - rng * 1.000   # 200% ext down
 
     return FiboLevels(
         signal_id=f"FIBO-{str(uuid.uuid4())[:6].upper()}",

@@ -19,7 +19,7 @@ logger = get_logger(__name__)
 def generate_md(results: Dict[str, BacktestResult], initial_balance: float = 10_000.0) -> str:
     """
     Markdown table comparing strategy performance across modes.
-    Columns: Mode | Trades | WR% | PF | MaxDD% | Sharpe | Total PnL | Return%
+    Columns: Mode | Trades | WR% | PF | MaxDD% | Sharpe | Closed PnL | Net Δ | Return%
     """
     lines = [
         "# Backtest Summary",
@@ -27,11 +27,13 @@ def generate_md(results: Dict[str, BacktestResult], initial_balance: float = 10_
         f"**Balance:** ${initial_balance:,.0f}  |  "
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
-        "| Mode | Trades | WR% | Profit Factor | Max DD% | Sharpe | Total PnL | Return% |",
-        "|------|--------|-----|---------------|---------|--------|-----------|---------|",
+        "| Mode | Trades | WR% | Profit Factor | Max DD% | Sharpe | Closed PnL | Net Δ | Return% |",
+        "|------|--------|-----|---------------|---------|--------|------------|-------|---------|",
     ]
     for mode, r in results.items():
-        return_pct = r.total_pnl / initial_balance * 100 if initial_balance > 0 else 0.0
+        return_pct = (
+            r.net_balance_change / initial_balance * 100 if initial_balance > 0 else 0.0
+        )
         lines.append(
             f"| {mode} "
             f"| {r.total_trades} "
@@ -40,6 +42,7 @@ def generate_md(results: Dict[str, BacktestResult], initial_balance: float = 10_
             f"| {r.max_drawdown_pct:.2f}% "
             f"| {r.sharpe_ratio:.2f} "
             f"| ${r.total_pnl:,.2f} "
+            f"| ${r.net_balance_change:,.2f} "
             f"| {return_pct:+.1f}% |"
         )
     lines += ["", "---", ""]

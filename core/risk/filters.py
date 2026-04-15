@@ -79,8 +79,8 @@ def filter_concurrent_positions(open_positions: int) -> FilterResult:
 def filter_volatility(atr_pips: float, session: str = "") -> FilterResult:
     min_limit = TRADING_CONFIG.min_atr_pips
 
-    # Relax minimum ATR requirement in high-volume sessions (Overlap/London)
-    if session in ("Overlap", "London"):
+    # Relax minimum ATR requirement in high-volume sessions (London / NY incl. Overlap)
+    if session in ("LONDON", "NY"):
         min_limit *= 0.7  # 30% reduction
 
     if atr_pips < min_limit:
@@ -126,16 +126,39 @@ def filter_news(news_active: bool) -> FilterResult:
 GLOBAL_COOLDOWN_CLEARED_AT: Optional[datetime] = None
 
 
+def _mode_revenge_limit_min() -> float:
+    """
+    Mode-aware revenge cooldown. Aggressive modes recover faster because entry
+    frequency is the whole point. Defaults derived from RISK_CONFIG.revenge_cooldown_min
+    but scaled per mode.
+    """
+    base = RISK_CONFIG.revenge_cooldown_min  # 15 default (was 30)
+    mode = TRADING_CONFIG.current_mode.value
+    mult = {
+        "CONSERVATIVE":    2.0,   # 30 min
+        "MODERATE":        1.3,   # ~20 min
+        "AGGRESSIVE":      0.66,  # 10 min
+        "VERY_AGGRESSIVE": 0.20,  # 5 min = 0.33, 3 min = 0.20
+        "ULTRA_SCALPER":   0.20,  # 3 min
+    }.get(mode, 1.0)
+    return max(1.0, base * mult)
+
+
 def filter_cooldown(last_closed_at: Optional[datetime], last_pnl: float) -> FilterResult:
     if last_closed_at is None or last_pnl >= 0:
         return True, "OK"
 
     global GLOBAL_COOLDOWN_CLEARED_AT
-    if GLOBAL_COOLDOWN_CLEARED_AT and last_closed_at < GLOBAL_COOLDOWN_CLEARED_AT:
-        return True, "OK"
+    _closed = last_closed_at if last_closed_at.tzinfo else last_closed_at.replace(tzinfo=timezone.utc)
+    if GLOBAL_COOLDOWN_CLEARED_AT:
+        _cleared = GLOBAL_COOLDOWN_CLEARED_AT
+        if _cleared.tzinfo is None:
+            _cleared = _cleared.replace(tzinfo=timezone.utc)
+        if _closed < _cleared:
+            return True, "OK"
 
-    elapsed = (datetime.now(timezone.utc) - last_closed_at).total_seconds() / 60.0
-    limit = RISK_CONFIG.revenge_cooldown_min
+    elapsed = (datetime.now(timezone.utc) - _closed).total_seconds() / 60.0
+    limit = _mode_revenge_limit_min()
     if elapsed < limit:
         return False, f"Anti-revenge cooldown active ({int(limit - elapsed)}m remaining)"
     return True, "OK"
@@ -145,18 +168,38 @@ def filter_entry_delay(last_opened_at: Optional[datetime], atr_pips: Optional[fl
     if last_opened_at is None:
         return True, "OK"
 
+    # Respect manual Telegram cooldown reset — bypass entry-delay if the last
+    # position was opened BEFORE the reset timestamp, or the reset happened
+    # within the last 60s (user explicitly wants to trade now).
+    global GLOBAL_COOLDOWN_CLEARED_AT
+    if GLOBAL_COOLDOWN_CLEARED_AT:
+        # Normalise tz — some callers may pass naive datetimes
+        _cleared = GLOBAL_COOLDOWN_CLEARED_AT
+        if _cleared.tzinfo is None:
+            _cleared = _cleared.replace(tzinfo=timezone.utc)
+        _opened = last_opened_at
+        if _opened.tzinfo is None:
+            _opened = _opened.replace(tzinfo=timezone.utc)
+        if _opened < _cleared:
+            return True, "OK"
+        cleared_age = (datetime.now(timezone.utc) - _cleared).total_seconds()
+        if cleared_age < 60:
+            return True, "OK"
+
     elapsed = (datetime.now(timezone.utc) - last_opened_at).total_seconds()
 
     # Adaptive delay by mode — aggressive modes use shorter gaps for frequent entries
     mode = TRADING_CONFIG.current_mode.value
-    if mode in ("ULTRA_SCALPER", "VERY_AGGRESSIVE"):
-        base_limit = 120  # 2 min
+    if mode == "ULTRA_SCALPER":
+        base_limit = 45    # 45s — near-instant re-entry
+    elif mode == "VERY_AGGRESSIVE":
+        base_limit = 75    # 1m15s
     elif mode == "AGGRESSIVE":
-        base_limit = 180  # 3 min
+        base_limit = 120   # 2 min
     elif mode == "MODERATE":
-        base_limit = 240  # 4 min
+        base_limit = 180   # 3 min
     else:
-        base_limit = 300  # 5 min (Conservative)
+        base_limit = 240   # 4 min (Conservative)
 
     # Extra 60s cooldown if M1 ATR is very high (> 25 pips per candle = whipsaw risk)
     if atr_pips and atr_pips >= 25.0:
@@ -354,8 +397,9 @@ def run_all_filters(
         filter_news(news_active),
     ]
 
-    # Pulse scalper bypasses rate-limit filters for rapid re-entry capability
-    if signal_type != "PULSE":
+    # Pulse and contra-flip bypass rate-limit filters.
+    # Contra-flip follows the new HTF bias after a structural exit — not revenge trading.
+    if signal_type not in ("PULSE", "CONTRA_FLIP"):
         checks.extend([
             filter_concurrent_positions(open_positions),
             filter_cooldown(last_trade_closed_at, last_trade_result_pnl),

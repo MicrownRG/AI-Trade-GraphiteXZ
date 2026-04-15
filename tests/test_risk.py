@@ -141,6 +141,11 @@ class TestPortfolio:
         pf.update_equity(-2_000.0)  # equity = 9000
         assert pf.drawdown_pct > 0
 
+    def test_debit_reduces_balance(self):
+        pf = Portfolio(10_000.0)
+        pf.debit(50.0, "fee")
+        assert pf.balance == 9_950.0
+
 
 
 

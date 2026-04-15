@@ -28,6 +28,7 @@ from core.structure.trend_logic import TrendLogic
 from config.trading_config import TRADING_CONFIG
 from config.risk_config import RISK_CONFIG
 from utils.logger import get_logger
+from utils.time_utils import get_session_name
 
 logger = get_logger(__name__)
 
@@ -192,18 +193,7 @@ class MeanReversionEngine:
             return None
 
         # ── 7. Session label ──────────────────────────────────────────────────
-        hour = current_time.hour
-        cfg  = TRADING_CONFIG
-        if cfg.london_session[0] <= hour < cfg.london_session[1] and cfg.ny_session[0] <= hour < cfg.ny_session[1]:
-            session = "Overlap"
-        elif cfg.london_session[0] <= hour < cfg.london_session[1]:
-            session = "London"
-        elif cfg.ny_session[0] <= hour < cfg.ny_session[1]:
-            session = "New York"
-        elif cfg.asian_session[0] <= hour < cfg.asian_session[1]:
-            session = "Asian"
-        else:
-            session = "Off-Hours"
+        session = get_session_name(current_time)
 
         signal = TradeSignal(
             signal_id       = f"MR-{str(uuid.uuid4())[:6].upper()}",

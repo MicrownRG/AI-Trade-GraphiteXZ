@@ -84,6 +84,88 @@ class TradeNote(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class AccountConfigModel(Base):
+    """
+    Per-account configuration persisted in the database.
+
+    Load priority (highest → lowest):
+        1. This table (keyed by MT5 account login)
+        2. Environment variables (BOT_<FIELD> prefix)
+        3. Hardcoded defaults in RiskConfig / TradingConfig
+
+    NULL in any column means "not yet set" — ConfigLoader will populate it
+    from .env / default on the very first startup and never overwrite again.
+    """
+    __tablename__ = "account_config"
+
+    id: Mapped[str]           = mapped_column(String(36), primary_key=True, default=_uuid)
+    account_id: Mapped[str]   = mapped_column(String(30), unique=True, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    # ── Risk params ───────────────────────────────────────────────────────────
+    risk_per_trade_pct:       Mapped[float | None]
+    min_rr_ratio:             Mapped[float | None]
+    max_lot_size:             Mapped[float | None]
+    hard_cutloss_daily_pct:   Mapped[float | None]
+    max_concurrent_trades:    Mapped[int   | None]
+    multi_entry_delay_sec:    Mapped[int   | None]
+    auto_close_stagnant_hours: Mapped[int  | None]
+    auto_close_eod:           Mapped[bool  | None]
+    min_margin_level_pct:     Mapped[float | None]
+    news_risk_multiplier:     Mapped[float | None]
+    revenge_cooldown_min:     Mapped[float | None]
+    consecutive_loss_limit:   Mapped[int   | None]
+    max_allowed_spread_pips:  Mapped[float | None]
+    max_slippage_pips:        Mapped[float | None]
+    min_signal_score:         Mapped[int   | None]
+    min_ai_confidence:        Mapped[float | None]
+
+    # ── Trading mode & behaviour ──────────────────────────────────────────────
+    trade_mode:               Mapped[str   | None] = mapped_column(String(20), nullable=True)
+    enable_asian_session:     Mapped[bool  | None]
+    enable_partial_close:     Mapped[bool  | None]
+    ai_adapter_enabled:       Mapped[bool  | None]
+    news_blackout_minutes:    Mapped[int   | None]
+
+
+class BotRuntimeStateModel(Base):
+    """
+    Per-account daily runtime state — persists cooldown flags across bot restarts.
+
+    State is keyed by (account_id, state_date).  On load, only the record for
+    TODAY is applied; a record from a previous day is treated as stale and ignored.
+    This means protections (hard cutloss, pulse guard) survive a bot crash/restart
+    within the same trading day.
+
+    Reset via Telegram (/reset) writes False/0/NULL back to this record so the
+    protection is cleared even if the bot is restarted again before midnight.
+    """
+    __tablename__ = "bot_runtime_state"
+
+    id: Mapped[str]           = mapped_column(String(36), primary_key=True, default=_uuid)
+    account_id: Mapped[str]   = mapped_column(String(30), nullable=False, index=True)
+    state_date: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    # Hard cutloss
+    daily_cutloss_triggered:   Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    # Pulse guard
+    pulse_suspended_today:     Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    pulse_consecutive_losses:  Mapped[int  | None] = mapped_column(Integer, nullable=True)
+
+    # Anti-revenge cooldown (stores the datetime of the last manual clear)
+    revenge_cooldown_cleared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class PerformanceMetrics(Base):
     __tablename__ = "performance_metrics"
 

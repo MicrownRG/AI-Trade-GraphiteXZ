@@ -226,6 +226,7 @@ class CommandHandler:
             "/cutloss":   self._cmd_cutloss,
             "/adapter":   self._cmd_adapter,
             "/backtest":  self._cmd_backtest,
+            "/config":    self._cmd_config,
         }
 
         fn = handlers.get(cmd)
@@ -474,23 +475,37 @@ class CommandHandler:
             action = data.split(":")[1]
             if action == "all":
                 import core.risk.filters as filters
-                filters.GLOBAL_COOLDOWN_CLEARED_AT = datetime.now(timezone.utc)
-                self.bot_ref.portfolio.pulse_suspended_today = False
-                self.bot_ref.portfolio.pulse_consecutive_losses = 0
+                _now = datetime.now(timezone.utc)
+                filters.GLOBAL_COOLDOWN_CLEARED_AT = _now
+                pf = self.bot_ref.portfolio
+                pf.pulse_suspended_today    = False
+                pf.pulse_consecutive_losses = 0
+                pf.daily_cutloss_triggered  = False   # ← include hard cutloss in full reset
                 if hasattr(self.bot_ref, "telegram") and hasattr(self.bot_ref.telegram, "_stalking_cooldowns"):
                     self.bot_ref.telegram._stalking_cooldowns.clear()
+                # Persist reset state to DB so it survives a bot restart
+                if hasattr(self.bot_ref, "state_repo") and self.bot_ref.state_repo:
+                    self.bot_ref.state_repo.save_from_portfolio(pf, revenge_cleared_at=_now)
                 self._answer_callback(cq_id, "✅ ALL cooldowns reset")
-                self._edit_message(chat_id, cq.get("message", {}).get("message_id"), "✅ *All Cooldowns Cleared*\\.\nBot is fully armed\\.")
+                self._edit_message(chat_id, cq.get("message", {}).get("message_id"), "✅ *All Cooldowns Cleared*\\.\nHard cutloss flag cleared\\. Bot is fully armed\\.")
                 
             elif action == "revenge":
                 import core.risk.filters as filters
-                filters.GLOBAL_COOLDOWN_CLEARED_AT = datetime.now(timezone.utc)
+                _now = datetime.now(timezone.utc)
+                filters.GLOBAL_COOLDOWN_CLEARED_AT = _now
+                if hasattr(self.bot_ref, "state_repo") and self.bot_ref.state_repo:
+                    self.bot_ref.state_repo.save_from_portfolio(
+                        self.bot_ref.portfolio, revenge_cleared_at=_now
+                    )
                 self._answer_callback(cq_id, "✅ Revenge SL timer cleared")
                 self._edit_message(chat_id, cq.get("message", {}).get("message_id"), "⏱️ *Revenge Cooldown Reset*\\.\nBot can enter immediately\\.")
-                
+
             elif action == "pulse":
-                self.bot_ref.portfolio.pulse_suspended_today = False
-                self.bot_ref.portfolio.pulse_consecutive_losses = 0
+                pf = self.bot_ref.portfolio
+                pf.pulse_suspended_today    = False
+                pf.pulse_consecutive_losses = 0
+                if hasattr(self.bot_ref, "state_repo") and self.bot_ref.state_repo:
+                    self.bot_ref.state_repo.save_from_portfolio(pf)
                 self._answer_callback(cq_id, "✅ Pulse Guard cleared")
                 self._edit_message(chat_id, cq.get("message", {}).get("message_id"), "⚡ *Pulse Scalper Guard Cleared*\\.\nReady for Asian burst\\.")
 
@@ -501,7 +516,10 @@ class CommandHandler:
                 self._edit_message(chat_id, cq.get("message", {}).get("message_id"), "👀 *Pantau Spam Cooldown Cleared*\\.")
 
             elif action == "cutloss":
-                self.bot_ref.portfolio.daily_cutloss_triggered = False
+                pf = self.bot_ref.portfolio
+                pf.daily_cutloss_triggered = False
+                if hasattr(self.bot_ref, "state_repo") and self.bot_ref.state_repo:
+                    self.bot_ref.state_repo.save_from_portfolio(pf)
                 self._answer_callback(cq_id, "✅ Hard Cutloss flag cleared")
                 self._edit_message(
                     chat_id, cq.get("message", {}).get("message_id"),
@@ -743,7 +761,54 @@ class CommandHandler:
     def _cmd_reset(self, chat_id: str, args: list) -> None:
         pf = self.portfolio
         cutloss_label = "🔴 Reset Hard Cutloss (ACTIVE)" if pf.daily_cutloss_triggered else "🔴 Reset Hard Cutloss"
-        msg = "🛠️ *Cooldown Manager*\n\nPilih batasan yang ingin dihapus paksa:"
+
+        # ── Live status block (all cooldown flags — persisted in DB) ─────────
+        import core.risk.filters as _filters
+        from datetime import datetime, timezone as _tz
+        revenge_cleared = _filters.GLOBAL_COOLDOWN_CLEARED_AT
+        last_closed     = pf.last_trade_closed_at
+        last_pnl        = pf.last_trade_result_pnl
+
+        def _flag(v: bool) -> str:
+            return "✅ TRUE" if v else "⚪ FALSE"
+
+        def _esc(s: str) -> str:
+            # Minimal MarkdownV2 escaping for dashes/dots/parens
+            for c in r"_*[]()~`>#+-=|{}.!":
+                s = s.replace(c, "\\" + c)
+            return s
+
+        if last_closed and last_pnl is not None and last_pnl < 0:
+            if revenge_cleared and last_closed < revenge_cleared:
+                revenge_state = "cleared"
+            else:
+                elapsed_min = (datetime.now(_tz.utc) - last_closed).total_seconds() / 60.0
+                limit = _filters._mode_revenge_limit_min()
+                remaining = max(0, limit - elapsed_min)
+                revenge_state = f"{int(remaining)}m left" if remaining > 0 else "expired"
+        else:
+            revenge_state = "n/a"
+
+        stalk_count = 0
+        try:
+            if hasattr(self, "bot_ref") and hasattr(self.bot_ref, "telegram"):
+                stalk_count = len(getattr(self.bot_ref.telegram, "_stalking_cooldowns", {}) or {})
+        except Exception:
+            pass
+
+        status_lines = [
+            f"• Hard Cutloss: {_flag(pf.daily_cutloss_triggered)}",
+            f"• Pulse Guard: {_flag(pf.pulse_suspended_today)} \\(streak {pf.pulse_consecutive_losses}\\)",
+            f"• Revenge: {_esc(revenge_state)}",
+            f"• Pantau entries: {stalk_count}",
+        ]
+        status = "\n".join(status_lines)
+
+        msg = (
+            "🛠️ *Cooldown Manager*\n"
+            f"{status}\n\n"
+            "Pilih batasan yang ingin dihapus paksa:"
+        )
         kb = {
             "inline_keyboard": [
                 [{"text": "🔄 Reset ALL Cooldowns", "callback_data": "reset:all"}],
@@ -820,7 +885,7 @@ class CommandHandler:
             risk_pct   = s.get("risk_per_trade", 0) * 100
             min_score  = s.get("min_score_threshold", "?")
 
-            logic_desc = "ICT \\+ Alpha Filter"
+            logic_desc = "SMC \\+ Alpha Filter"
             if mode.name in ("AGGRESSIVE", "MODERATE"):   logic_desc = "SMC Hybrid \\+ Alpha"
             if mode.name == "VERY_AGGRESSIVE":             logic_desc = "Max Momentum \\+ Alpha"
 
@@ -930,6 +995,98 @@ class CommandHandler:
                 "Past analysis remains saved and will be reloaded when re\\-enabled\\."
             )
         self._reply(chat_id, msg)
+
+    def _cmd_config(self, chat_id: str, args: list) -> None:
+        """
+        View or update a single config value in the DB for the current account.
+
+        Usage:
+          /config              — show all current config values
+          /config <field> <value>  — update one field (writes to DB immediately)
+
+        Examples:
+          /config risk_per_trade_pct 1.5
+          /config trade_mode AGGRESSIVE
+          /config enable_asian_session false
+        """
+        if not hasattr(self, "bot_ref") or not self.bot_ref:
+            self._reply(chat_id, "⚠️ Bot reference missing\\.")
+            return
+
+        account_id = getattr(self.bot_ref, "account_id", None)
+        if not account_id:
+            self._reply(chat_id, "⚠️ Account ID not available\\. Bot not fully initialised\\.")
+            return
+
+        from config.config_loader import _FIELD_MAP, _apply_to_config, _parse_env
+        from database.connection import get_session
+        from database.models import AccountConfigModel
+
+        # ── Show current config ───────────────────────────────────────────────
+        if not args:
+            try:
+                with get_session() as session:
+                    row = session.query(AccountConfigModel).filter_by(account_id=account_id).first()
+
+                lines = [f"⚙️ *Config — Account \\#{account_id}*\n{'─'*22}"]
+                for _, db_field, _, _ in _FIELD_MAP:
+                    db_val = getattr(row, db_field, None) if row else None
+                    val_str = str(db_val) if db_val is not None else "_default_"
+                    lines.append(f"`{db_field}` \\= `{val_str}`")
+                lines.append(f"\n_Use `/config <field> <value>` to update_")
+                self._reply(chat_id, "\n".join(lines))
+            except Exception as e:
+                self._reply(chat_id, f"⚠️ Could not read config: {str(e)[:80]}")
+            return
+
+        # ── Update a single field ─────────────────────────────────────────────
+        if len(args) < 2:
+            self._reply(chat_id, "⚠️ Usage: `/config <field> <value>`")
+            return
+
+        field = args[0].lower()
+        raw   = " ".join(args[1:])
+
+        # Find the field in the map
+        match = next((m for m in _FIELD_MAP if m[1] == field), None)
+        if match is None:
+            valid = "  ".join(m[1] for m in _FIELD_MAP)
+            self._reply(chat_id, f"⚠️ Unknown field `{field}`\\.\nValid: `{valid}`")
+            return
+
+        _, db_field, typ, _ = match
+        try:
+            value = _parse_env(raw, typ)
+        except (ValueError, TypeError):
+            self._reply(chat_id, f"⚠️ Cannot parse `{raw}` as `{typ.__name__}`")
+            return
+
+        # Write to DB
+        try:
+            with get_session() as session:
+                row = session.query(AccountConfigModel).filter_by(account_id=account_id).first()
+                if row is None:
+                    row = AccountConfigModel(account_id=account_id)
+                    session.add(row)
+                db_write = value.value if hasattr(value, "value") else value
+                setattr(row, db_field, db_write)
+        except Exception as e:
+            self._reply(chat_id, f"⚠️ DB write failed: {str(e)[:80]}")
+            return
+
+        # Apply to live config immediately
+        try:
+            _apply_to_config(db_field, value)
+        except Exception as e:
+            self._reply(chat_id, f"⚠️ Live apply failed: {str(e)[:80]}")
+            return
+
+        self._reply(chat_id, (
+            f"✅ *Config updated*\n"
+            f"`{db_field}` \\= `{db_write}`\n"
+            f"_Applied immediately\\. Persisted to DB for account \\#{account_id}\\._"
+        ))
+        logger.info(f"Config updated via Telegram: [{account_id}] {db_field}={db_write}")
 
     def _cmd_backtest(self, chat_id: str, args: list) -> None:
         """
@@ -1175,6 +1332,7 @@ class CommandHandler:
             {"command": "cutloss", "description": "Panic close all positions"},
             {"command": "reset",   "description": "Cooldown management menu"},
             {"command": "asian",   "description": "Toggle Asian session on/off"},
+            {"command": "backtest", "description": "Run backtest"},
             {"command": "partial", "description": "Toggle Partial Close feature (50% TP1)"},
             {"command": "mode",    "description": "Switch trade mode (Con/Mod/Agr/V-Agr)"},
             {"command": "mode_info", "description": "Show risk/config for each mode"},

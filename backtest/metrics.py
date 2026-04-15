@@ -24,6 +24,7 @@ def print_report(result: BacktestResult) -> None:
     print(f"  Win Rate          : {result.win_rate:.2f}%")
     print(f"  Profit Factor     : {result.profit_factor:.3f}")
     print(f"  Total PnL         : ${result.total_pnl:,.2f}")
+    print(f"  Net balance Δ     : ${result.net_balance_change:,.2f}")
     print(f"  Max Drawdown      : {result.max_drawdown_pct:.2f}%")
     print(f"  Sharpe Ratio      : {result.sharpe_ratio:.3f}")
     print(sep)

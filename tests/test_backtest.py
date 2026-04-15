@@ -88,3 +88,36 @@ class TestBacktestMetrics:
         result = engine.run(df_ltf=full_dataset, warm_up_bars=100)
         # Should not raise
         print_report(result)
+
+
+class TestWalkForward:
+    def test_splits_train_before_test(self, full_dataset):
+        from backtest.walk_forward import walk_forward_splits
+
+        splits = walk_forward_splits(
+            full_dataset, n_splits=4, test_size=80, min_train_bars=120
+        )
+        assert len(splits) >= 1
+        for tr, te in splits:
+            assert len(tr) >= 120
+            assert len(te) == 80
+            assert tr.index[-1] < te.index[0]
+
+
+class TestBacktestCosts:
+    def test_net_equals_closed_pnl_without_fees(self, full_dataset):
+        engine = BacktestEngine(initial_balance=10_000, use_ai=False)
+        result = engine.run(df_ltf=full_dataset, warm_up_bars=100)
+        assert abs(result.net_balance_change - result.total_pnl) < 0.02
+
+    def test_commission_reduces_net_vs_closed_pnl(self, full_dataset):
+        from backtest.engine import BacktestCostModel
+
+        engine = BacktestEngine(
+            initial_balance=10_000,
+            use_ai=False,
+            cost=BacktestCostModel(commission_usd_per_lot_per_side=25.0),
+        )
+        result = engine.run(df_ltf=full_dataset, warm_up_bars=100)
+        if result.total_trades > 0:
+            assert result.net_balance_change <= result.total_pnl + 1e-6

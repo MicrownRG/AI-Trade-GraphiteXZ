@@ -10,17 +10,19 @@ Features:
 - Session filtering
 - Equity curve tracking
 - Realistic fill logic (market orders on next bar open)
+- Optional costs: per-side commission, overnight swap, partial TP1, entry fill fraction
 """
 from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime
 import pandas as pd
 import numpy as np
 
 from core.structure.swing import detect_swings
 from core.signal.signal_engine import SignalEngine
+from core.signal.advanced_signal_engine import AdvancedSignalEngine
 from core.risk.executor import RiskExecutor, TradeOrder
 from core.risk.portfolio import Portfolio, ClosedTrade
 
@@ -40,15 +42,31 @@ SLIPPAGE_PRICE = SLIPPAGE_PIPS * 0.1
 
 
 @dataclass
+class BacktestCostModel:
+    """Optional costs for more realistic backtests (tahap 2)."""
+
+    # Charged per lot per side (open = one side, close = one side).
+    commission_usd_per_lot_per_side: float = 0.0
+    # Deducted once per calendar day held when the bar date rolls forward.
+    swap_usd_per_lot_per_night: float = 0.0
+    # Fraction of position closed at TP1 (0 = skip partial, only TP2).
+    tp1_close_fraction: float = 0.0
+    # Simulated partial fill at entry (1.0 = full size).
+    entry_fill_fraction: float = 1.0
+
+
+@dataclass
 class BacktestPosition:
     trade_id: str
     signal_id: str
+    symbol: str
     direction: str
     entry_price: float
     stop_loss: float
     take_profit: float
     lot_size: float
     opened_at: datetime
+    take_profit_1: Optional[float] = None
     tp1_hit: bool = False
     half_closed: bool = False
 
@@ -65,6 +83,8 @@ class BacktestResult:
     equity_curve: List[float] = field(default_factory=list)
     trades: List[ClosedTrade] = field(default_factory=list)
     monthly_breakdown: Dict[str, float] = field(default_factory=dict)
+    # Cash after all closed-trade PnL, open/close commission, swap debits, etc.
+    net_balance_change: float = 0.0
 
 
 class BacktestEngine:
@@ -73,13 +93,17 @@ class BacktestEngine:
         initial_balance: float = 10_000.0,
         use_ai: bool = False,
         allowed_strategies: list[str] = None,
+        use_advanced_signal: bool = True,
+        cost: Optional[BacktestCostModel] = None,
     ):
         self.initial_balance = initial_balance
         self.allowed_strategies = allowed_strategies or ["all"]
         self.portfolio       = Portfolio(initial_balance)
-        self.signal_engine   = SignalEngine()
+        self.use_advanced_signal = use_advanced_signal
+        self.signal_engine   = AdvancedSignalEngine() if use_advanced_signal else SignalEngine()
         self.risk_executor   = RiskExecutor(self.portfolio)
         self.ai_scorer       = AIScorer(enabled=use_ai and AI_CONFIG.enabled_in_backtest)
+        self.cost = cost or BacktestCostModel()
         self.open_positions: Dict[str, BacktestPosition] = {}
         self.equity_curve: List[float] = [initial_balance]
         self.trades_today     = 0
@@ -90,6 +114,8 @@ class BacktestEngine:
         df_ltf: pd.DataFrame,         # M15 — primary entry TF
         df_h1: Optional[pd.DataFrame] = None,
         df_h4: Optional[pd.DataFrame] = None,
+        df_m5: Optional[pd.DataFrame] = None,
+        df_m1: Optional[pd.DataFrame] = None,
         warm_up_bars: int = 100,
     ) -> BacktestResult:
         """
@@ -108,6 +134,17 @@ class BacktestEngine:
         if df_h4 is None:
             df_h4 = resample_to_htf(df_ltf, "4h")
             df_h4 = prepare_backtest_data(df_h4)
+        if df_m5 is None:
+            df_m5 = df_ltf
+        else:
+            df_m5 = prepare_backtest_data(df_m5)
+        if df_m1 is None:
+            df_m1 = df_ltf
+        else:
+            df_m1 = prepare_backtest_data(df_m1)
+        # M30 is used by AdvancedSignalEngine for multi-TF scoring.
+        df_m30 = resample_to_htf(df_ltf, "30min")
+        df_m30 = prepare_backtest_data(df_m30)
 
         n = len(df_ltf)
 
@@ -117,6 +154,15 @@ class BacktestEngine:
 
             # ── Day reset ─────────────────────────────────────────────────────
             if self._last_date is None or bar_time.date() != self._last_date:
+                if (
+                    self._last_date is not None
+                    and bar_time.date() != self._last_date
+                    and self.cost.swap_usd_per_lot_per_night > 0
+                    and self.open_positions
+                ):
+                    for p in self.open_positions.values():
+                        fee = self.cost.swap_usd_per_lot_per_night * p.lot_size
+                        self.portfolio.debit(fee, "overnight_swap")
                 self.trades_today = 0
                 self.portfolio.record_day_start()
                 self._last_date = bar_time.date()
@@ -137,13 +183,30 @@ class BacktestEngine:
             if len(window_h4) < 20 or len(window_h1) < 20:
                 continue
 
-            signal = self.signal_engine.generate(
-                df_h4=window_h4,
-                df_h1=window_h1,
-                df_ltf=window_ltf,
-                current_time=bar_time.to_pydatetime(),
-                symbol="XAUUSD",
-            )
+            if self.use_advanced_signal:
+                # Use true lower-TF windows when supplied; otherwise fallback to
+                # M15 proxy for backward-compatible datasets.
+                window_m30 = self._align_htf(df_m30, bar_time, "30min")
+                window_m5 = self._align_htf(df_m5, bar_time, "5min")
+                window_m1 = self._align_htf(df_m1, bar_time, "1min")
+                signal = self.signal_engine.generate(
+                    df_h4=window_h4,
+                    df_h1=window_h1,
+                    df_m30=window_m30 if len(window_m30) > 0 else None,
+                    df_m15=window_ltf,
+                    df_m5=window_m5 if len(window_m5) > 0 else window_ltf,
+                    df_m1=window_m1 if len(window_m1) > 0 else window_ltf,
+                    current_time=bar_time.to_pydatetime(),
+                    symbol="XAUUSD",
+                )
+            else:
+                signal = self.signal_engine.generate(
+                    df_h4=window_h4,
+                    df_h1=window_h1,
+                    df_ltf=window_ltf,
+                    current_time=bar_time.to_pydatetime(),
+                    symbol="XAUUSD",
+                )
 
             if signal is None:
                 continue
@@ -184,18 +247,39 @@ class BacktestEngine:
                 next_open=next_bar["open"],
             )
 
+            frac = min(1.0, max(0.0, self.cost.entry_fill_fraction))
+            lot = round(order.lot_size * frac, 2)
+            if order.lot_size >= 0.01:
+                lot = max(0.01, min(lot, order.lot_size))
+            else:
+                lot = order.lot_size
+
+            if order.take_profit_levels is not None:
+                tp2 = order.take_profit_levels.tp2
+                tp1 = order.take_profit_levels.tp1
+            else:
+                tp2 = order.take_profit
+                tp1 = None
+
             pos = BacktestPosition(
                 trade_id=str(uuid.uuid4())[:10],
                 signal_id=signal.signal_id,
+                symbol=signal.symbol,
                 direction=order.direction,
                 entry_price=fill_price,
                 stop_loss=order.stop_loss,
-                take_profit=order.take_profit_levels.tp2,
-                lot_size=order.lot_size,
+                take_profit=tp2,
+                lot_size=lot,
                 opened_at=bar_time.to_pydatetime(),
+                take_profit_1=tp1,
             )
             self.open_positions[pos.trade_id] = pos
             self.portfolio.open_trade(pos.trade_id, vars(pos))
+            if self.cost.commission_usd_per_lot_per_side > 0:
+                self.portfolio.debit(
+                    self.cost.commission_usd_per_lot_per_side * lot,
+                    "commission_open",
+                )
             self.trades_today += 1
 
             logger.debug(
@@ -206,8 +290,12 @@ class BacktestEngine:
         # ── Force-close remaining positions ───────────────────────────────────
         final_price = df_ltf["close"].iloc[-1]
         for tid, pos in list(self.open_positions.items()):
-            pnl = self._calc_pnl(pos.direction, pos.entry_price, final_price, pos.lot_size)
-            self._close_position(tid, pos, final_price, pnl, "end_of_backtest")
+            gross = self._calc_pnl(pos.direction, pos.entry_price, final_price, pos.lot_size)
+            comm_close = self.cost.commission_usd_per_lot_per_side * pos.lot_size
+            net = round(gross - comm_close, 2)
+            self._close_position(
+                tid, pos, final_price, net, "end_of_backtest", df_ltf.index[-1].to_pydatetime()
+            )
 
         logger.info(
             f"Backtest complete: trades={self.portfolio.total_trades} "
@@ -219,35 +307,114 @@ class BacktestEngine:
 
     def _manage_positions(self, bar: pd.Series, bar_time) -> None:
         for tid, pos in list(self.open_positions.items()):
-            h, l = bar["high"], bar["low"]
+            self._process_position_bar(tid, pos, bar, bar_time)
 
-            # SL hit
-            sl_hit = (pos.direction == "buy" and l <= pos.stop_loss) or \
-                     (pos.direction == "sell" and h >= pos.stop_loss)
+    def _tp1_enabled(self, pos: BacktestPosition) -> bool:
+        if self.cost.tp1_close_fraction <= 0 or pos.half_closed:
+            return False
+        if pos.take_profit_1 is None:
+            return False
+        # Skip degenerate TP1 == TP2
+        if abs(pos.take_profit_1 - pos.take_profit) < 1e-6:
+            return False
+        return True
+
+    def _process_position_bar(
+        self, tid: str, pos: BacktestPosition, bar: pd.Series, bar_time
+    ) -> None:
+        h, l = bar["high"], bar["low"]
+        closed_at = (
+            bar_time.to_pydatetime() if hasattr(bar_time, "to_pydatetime") else bar_time
+        )
+
+        while True:
+            # SL (worst case before TP)
+            sl_hit = (pos.direction == "buy" and l <= pos.stop_loss) or (
+                pos.direction == "sell" and h >= pos.stop_loss
+            )
             if sl_hit:
                 exit_p = pos.stop_loss
-                pnl    = self._calc_pnl(pos.direction, pos.entry_price, exit_p, pos.lot_size)
-                self._close_position(tid, pos, exit_p, pnl, "sl")
-                continue
+                gross = self._calc_pnl(pos.direction, pos.entry_price, exit_p, pos.lot_size)
+                comm_close = self.cost.commission_usd_per_lot_per_side * pos.lot_size
+                net = round(gross - comm_close, 2)
+                self._close_position(tid, pos, exit_p, net, "sl", closed_at)
+                return
 
-            # TP hit
-            tp_hit = (pos.direction == "buy" and h >= pos.take_profit) or \
-                     (pos.direction == "sell" and l <= pos.take_profit)
+            # Partial TP1 (can chain to TP2 same bar)
+            if self._tp1_enabled(pos):
+                tp1 = pos.take_profit_1
+                assert tp1 is not None
+                tp1_hit = (pos.direction == "buy" and h >= tp1) or (
+                    pos.direction == "sell" and l <= tp1
+                )
+                if tp1_hit:
+                    if self._take_tp1_partial(tid, pos, tp1, closed_at):
+                        continue
+                    # Min-lot / degenerate partial: fall through to main TP same bar.
+
+            tp_hit = (pos.direction == "buy" and h >= pos.take_profit) or (
+                pos.direction == "sell" and l <= pos.take_profit
+            )
             if tp_hit:
                 exit_p = pos.take_profit
-                pnl    = self._calc_pnl(pos.direction, pos.entry_price, exit_p, pos.lot_size)
-                self._close_position(tid, pos, exit_p, pnl, "tp2")
-                continue
+                gross = self._calc_pnl(pos.direction, pos.entry_price, exit_p, pos.lot_size)
+                comm_close = self.cost.commission_usd_per_lot_per_side * pos.lot_size
+                net = round(gross - comm_close, 2)
+                self._close_position(tid, pos, exit_p, net, "tp2", closed_at)
+                return
 
-            # Trailing stop update
             current = bar["close"]
-            new_sl  = trailing_stop(pos.entry_price, current, pos.stop_loss,
-                                     pos.direction, trail_pips=20.0)
+            new_sl = trailing_stop(
+                pos.entry_price, current, pos.stop_loss, pos.direction, trail_pips=20.0
+            )
             pos.stop_loss = new_sl
+            self.portfolio.update_trade_sl_tp(tid, sl=new_sl)
+            return
+
+    def _take_tp1_partial(
+        self, tid: str, pos: BacktestPosition, exit_p: float, bar_time: datetime
+    ) -> bool:
+        """Returns True if partial was taken and caller should re-check exits."""
+        frac = self.cost.tp1_close_fraction
+        close_lot = round(pos.lot_size * frac, 2)
+        remaining = round(pos.lot_size - close_lot, 2)
+        if close_lot < 0.01 or remaining < 0.01:
+            pos.half_closed = True
+            return False
+
+        gross = self._calc_pnl(pos.direction, pos.entry_price, exit_p, close_lot)
+        comm_close = self.cost.commission_usd_per_lot_per_side * close_lot
+        net = round(gross - comm_close, 2)
+        ct = ClosedTrade(
+            trade_id=f"{tid}_P",
+            symbol="XAUUSD",
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            exit_price=exit_p,
+            lot_size=close_lot,
+            pnl=net,
+            pnl_pips=net / (close_lot * 10.0) if close_lot > 0 else 0,
+            opened_at=pos.opened_at,
+            closed_at=bar_time,
+            reason="tp1",
+        )
+        self.portfolio.partial_close_trade(ct, remaining)
+        pos.lot_size = remaining
+        pos.half_closed = True
+        pos.tp1_hit = True
+        # Move to breakeven after first target
+        pos.stop_loss = pos.entry_price
+        self.portfolio.update_trade_sl_tp(tid, sl=pos.stop_loss, tp=pos.take_profit)
+        ot = self.portfolio.open_trades.get(tid)
+        if ot is not None:
+            ot["lot_size"] = remaining
+            ot["stop_loss"] = pos.stop_loss
+        return True
+
 
     def _close_position(
         self, tid: str, pos: BacktestPosition,
-        exit_price: float, pnl: float, reason: str
+        exit_price: float, pnl: float, reason: str, closed_at: datetime
     ) -> None:
         ct = ClosedTrade(
             trade_id=tid,
@@ -259,7 +426,7 @@ class BacktestEngine:
             pnl=pnl,
             pnl_pips=pnl / (pos.lot_size * 10.0) if pos.lot_size > 0 else 0,
             opened_at=pos.opened_at,
-            closed_at=datetime.now(timezone.utc),
+            closed_at=closed_at,
             reason=reason,
         )
         self.portfolio.close_trade(ct)
@@ -302,11 +469,9 @@ class BacktestEngine:
         gross_p   = sum(t.pnl for t in wins)
         gross_l   = abs(sum(t.pnl for t in losses))
         pf        = gross_p / gross_l if gross_l > 0 else float("inf")
-        avg_rr    = (
-            sum(abs(t.exit_price - t.entry_price) / abs(t.entry_price - t.exit_price)
-                for t in wins) / len(wins)
-            if wins else 0
-        )
+        avg_win = float(np.mean([t.pnl for t in wins])) if wins else 0.0
+        avg_loss = float(np.mean([t.pnl for t in losses])) if losses else 0.0
+        avg_rr = (avg_win / abs(avg_loss)) if avg_loss < 0 else 0.0
 
         eq = np.array(self.equity_curve)
         peak       = np.maximum.accumulate(eq)
@@ -338,4 +503,5 @@ class BacktestEngine:
             equity_curve=self.equity_curve,
             trades=trades,
             monthly_breakdown=monthly,
+            net_balance_change=round(self.portfolio.balance - self.initial_balance, 2),
         )

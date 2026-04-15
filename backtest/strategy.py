@@ -29,11 +29,11 @@ class BaseStrategy(ABC):
         """Called on every new bar. Returns a signal or None."""
 
 
-class ICTStrategy(BaseStrategy):
+class SMCStrategy(BaseStrategy):
     """
-    Standard ICT-based strategy using BOS / CHOCH / Liquidity / Displacement.
+    Standard SMC-based strategy using BOS / CHOCH / Liquidity / Displacement.
     """
-    name = "ICT_Standard"
+    name = "SMC_Standard"
 
     def __init__(self):
         self.engine = SignalEngine()
@@ -47,11 +47,11 @@ class ICTStrategy(BaseStrategy):
         )
 
 
-class AdvancedICTStrategy(BaseStrategy):
+class AdvancedSMCStrategy(BaseStrategy):
     """
-    ICT strategy with FVG / Order Block refinement on M5.
+    SMC strategy with FVG / Order Block refinement on M5.
     """
-    name = "ICT_Advanced_FVG"
+    name = "SMC_Advanced_FVG"
 
     def __init__(self):
         self.engine = AdvancedSignalEngine()

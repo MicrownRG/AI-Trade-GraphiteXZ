@@ -395,7 +395,7 @@ from core.signal.signal_engine import SignalEngine, TradeSignal
 from core.structure.htf_bias   import HTFBias
 from ai.scorer import AIScorer, AIEvaluation
 
-def make_mock_signal(score=7, session="London"):
+def make_mock_signal(score=7, session="LONDON"):
     return TradeSignal(
         signal_id="t01", symbol="XAUUSD",
         timestamp=datetime(2024,1,15,10,0),
@@ -430,32 +430,32 @@ else:
 scorer = AIScorer(enabled=False)
 
 def test_ai_eval_type():
-    e = scorer._rule_based(make_mock_signal(7, "London"))
+    e = scorer._rule_based(make_mock_signal(7, "LONDON"))
     assert_(isinstance(e, AIEvaluation))
 run("AI scorer returns AIEvaluation", test_ai_eval_type)
 
 def test_ai_source_rule_based():
-    e = scorer._rule_based(make_mock_signal(7, "London"))
+    e = scorer._rule_based(make_mock_signal(7, "LONDON"))
     assert_(e.source == "rule_based")
 run("AI scorer source is rule_based", test_ai_source_rule_based)
 
 def test_ai_decision_valid():
-    e = scorer._rule_based(make_mock_signal(7, "London"))
+    e = scorer._rule_based(make_mock_signal(7, "LONDON"))
     assert_(e.decision in ("TAKE", "SKIP"))
 run("AI decision is TAKE or SKIP", test_ai_decision_valid)
 
 def test_ai_confidence_range():
-    e = scorer._rule_based(make_mock_signal(7, "London"))
+    e = scorer._rule_based(make_mock_signal(7, "LONDON"))
     assert_(0.0 <= e.confidence <= 1.0)
 run("AI confidence in [0.0, 1.0]", test_ai_confidence_range)
 
 def test_ai_high_score_take():
-    e = scorer._rule_based(make_mock_signal(score=7, session="London"))
+    e = scorer._rule_based(make_mock_signal(score=7, session="LONDON"))
     assert_(e.decision == "TAKE", f"Expected TAKE for score=7, got {e.decision}")
 run("high score London signal → TAKE", test_ai_high_score_take)
 
 def test_ai_low_score_skip():
-    e = scorer._rule_based(make_mock_signal(score=2, session="Off-Hours"))
+    e = scorer._rule_based(make_mock_signal(score=2, session="TRANSITION"))
     assert_(e.decision == "SKIP", f"Expected SKIP for score=2 off-hours, got {e.decision}")
 run("low score off-hours signal → SKIP", test_ai_low_score_skip)
 

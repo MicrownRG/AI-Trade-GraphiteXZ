@@ -99,6 +99,17 @@ class TradingConfig:
     #     and SL floors widen automatically to avoid liquidity sweeps
     # -------------------------------------------------------------------------
     mode_settings: Dict[TradeMode, Dict] = field(default_factory=lambda: {
+        # ── Profit-lock fields (added) ────────────────────────────────────────
+        # micro_profit_lock_r   : R-multiple at which to ratchet SL to entry+buffer
+        #                         (guarantees a tiny profit — staircase equity curve)
+        # micro_lock_buffer_pips: buffer above entry applied at the micro-lock step
+        # partial_close_fraction: fraction of lot closed at TP1 (rest runs to TP2)
+        # news_aligned_tp_mult  : TP multiplier applied when news sentiment agrees with
+        #                         signal direction AND HTF is aligned (momentum boost)
+        # quick_harvest_on_adverse_news:
+        #                         close any in-profit trade immediately when news
+        #                         sentiment flips against it
+        # ---------------------------------------------------------------------
         TradeMode.CONSERVATIVE: {
             "risk_per_trade":       0.005,   # 0.5% — minimum risk
             "min_score_threshold":  8,        # very selective: only high-confluence setups
@@ -109,6 +120,12 @@ class TradingConfig:
             "trailing_pips":        40.0,     # wide trail to survive normal M15 pullbacks
             "pulse_scalping":       False,    # disabled — conservative avoids M1 extremes
             "max_daily_trades":     5,        # guard: at most 5 trades per day
+            # Profit-lock: small lock early, then loose trail → swing-panjang profit besar
+            "micro_profit_lock_r":       0.30,
+            "micro_lock_buffer_pips":    2.0,
+            "partial_close_fraction":    0.30,   # only close 30% at TP1, let 70% run
+            "news_aligned_tp_mult":      1.80,
+            "quick_harvest_on_adverse_news": True,
         },
         TradeMode.MODERATE: {
             "risk_per_trade":       0.01,    # 1.0%
@@ -120,6 +137,11 @@ class TradingConfig:
             "trailing_pips":        35.0,     # slightly tighter trail
             "pulse_scalping":       False,    # disabled for moderate risk profile
             "max_daily_trades":     10,
+            "micro_profit_lock_r":       0.25,
+            "micro_lock_buffer_pips":    1.5,
+            "partial_close_fraction":    0.35,
+            "news_aligned_tp_mult":      1.60,
+            "quick_harvest_on_adverse_news": True,
         },
         TradeMode.AGGRESSIVE: {
             "risk_per_trade":       0.02,    # 2.0%
@@ -132,6 +154,11 @@ class TradingConfig:
             "trailing_pips":        25.0,     # tighter trail — small TF entries
             "pulse_scalping":       True,     # enabled — frequent M1 entries in calm sessions
             "max_daily_trades":     0,        # 0 = unlimited
+            "micro_profit_lock_r":       0.20,
+            "micro_lock_buffer_pips":    1.0,
+            "partial_close_fraction":    0.50,
+            "news_aligned_tp_mult":      1.40,
+            "quick_harvest_on_adverse_news": True,
         },
         TradeMode.VERY_AGGRESSIVE: {
             "risk_per_trade":       0.025,   # 2.5% — 2 losses before 5% hard cutloss
@@ -145,6 +172,11 @@ class TradingConfig:
             "pulse_scalping":       True,     # always active (blocked automatically in US/Overlap)
             "pulse_compound":       False,
             "max_daily_trades":     0,        # unlimited
+            "micro_profit_lock_r":       0.15,
+            "micro_lock_buffer_pips":    0.8,
+            "partial_close_fraction":    0.60,
+            "news_aligned_tp_mult":      1.30,
+            "quick_harvest_on_adverse_news": True,
         },
         TradeMode.ULTRA_SCALPER: {
             "risk_per_trade":       0.05,    # 5.0% — 1 loss before cutloss; compound handles growth
@@ -157,6 +189,11 @@ class TradingConfig:
             "pulse_scalping":       True,     # always active
             "pulse_compound":       True,     # granular lot compounding enabled
             "max_daily_trades":     0,
+            "micro_profit_lock_r":       0.10,
+            "micro_lock_buffer_pips":    0.5,
+            "partial_close_fraction":    0.70,   # aggressive harvest (partial_close flag is False so unused unless flipped)
+            "news_aligned_tp_mult":      1.20,
+            "quick_harvest_on_adverse_news": True,
         },
     })
 

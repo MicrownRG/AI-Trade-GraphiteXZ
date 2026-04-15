@@ -41,7 +41,7 @@ class RiskConfig:
     news_risk_multiplier: float = 0.5     # reduce risk by 50% during news
 
     # ── Cooldown & loss streak ────────────────────────────────────────────────
-    revenge_cooldown_min: float = 30.0    # cool-down after any loss
+    revenge_cooldown_min: float = 15.0    # base cool-down after any loss (mode-scaled in filters.py)
     consecutive_loss_limit: int = 5       # pause if 5 losses in a row
 
     # ── Spread / slippage tolerances ─────────────────────────────────────────

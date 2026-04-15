@@ -62,6 +62,9 @@ class AdvancedSignalEngine(SignalEngine):
         threshold = settings.get("min_score_threshold", 5)
         
         score = 0
+        mtf = None
+        reversal_detected = False
+        master_dir = None
         
         # ── 1. Direction & Confluence Analysis ───────────────────────────────
         if TRADING_CONFIG.enable_multi_tf:
@@ -121,13 +124,34 @@ class AdvancedSignalEngine(SignalEngine):
                 if trend_obj.rejection != "NONE":
                     logger.info(f"🕯\ufe0f REJECTION WICK DETECTED: {tf_name.upper()} shows strong {trend_obj.rejection} rejection.")
             
-            # Reversal detection bonus
-            if mtf.reversal_detected and direction:
-                logger.info(f"🔄 REVERSAL DETECTED: LTF opposing HTF — potential apex flip ({direction.upper()})")
-                score += 3
+            # Reversal alignment handling:
+            # when LTF momentum opposes HTF, do NOT blindly boost current direction.
+            reversal_detected = mtf.reversal_detected
+            if reversal_detected and direction:
+                m1_bias = (mtf.tfs.get("m1").bias if mtf.tfs.get("m1") else "NEUTRAL")
+                m5_bias = (mtf.tfs.get("m5").bias if mtf.tfs.get("m5") else "NEUTRAL")
+                _master_bias_now = mtf.master_bias
+                master_dir = "buy" if _master_bias_now == "BULLISH" else ("sell" if _master_bias_now == "BEARISH" else None)
+
+                if master_dir and direction == master_dir:
+                    # Existing direction is still following HTF while LTF is already opposing:
+                    # treat as warning (likely pullback/flip), reduce confidence.
+                    score -= 3
+                    logger.info(
+                        f"🔄 REVERSAL WARNING: LTF ({m5_bias}/{m1_bias}) opposes HTF {_master_bias_now}. "
+                        f"Reducing score for {direction.upper()} setup."
+                    )
+                else:
+                    # Direction already follows reversal context (or HTF is neutral).
+                    logger.info(
+                        f"🔄 REVERSAL ALIGNED: LTF ({m5_bias}/{m1_bias}) supports {direction.upper()} "
+                        f"against/without HTF anchor."
+                    )
+                    score += 3
             
             best_tf_adx = (mtf.tfs.get("h4") or mtf.tfs.get("h1")).adx if (mtf.tfs.get("h4") or mtf.tfs.get("h1")) else 0
             master_bias = mtf.master_bias
+            master_dir = "buy" if master_bias == "BULLISH" else ("sell" if master_bias == "BEARISH" else None)
         else:
             # Fallback for Disabled Multi-TF: Use simple H1/H4 primary trend
             trend_h1 = self.trend.analyze_trend(df_h1)
@@ -145,6 +169,7 @@ class AdvancedSignalEngine(SignalEngine):
                 
             best_tf_adx = trend_h1["adx"]
             master_bias = trend_h1["bias"]
+            master_dir = "buy" if master_bias == "BULLISH" else ("sell" if master_bias == "BEARISH" else None)
 
         if not direction:
             logger.info(f"Signal: no bias detected (multi_tf={TRADING_CONFIG.enable_multi_tf})")
@@ -236,7 +261,9 @@ class AdvancedSignalEngine(SignalEngine):
                     rsi_curr = rsi_m15_series.iloc[-1]
 
                     hidden_bull = (price_low_curr > price_low_prev) and (rsi_curr < rsi_prev) and direction == "buy"
-                    hidden_bear = (price_low_curr < price_low_prev) and (rsi_curr > rsi_prev) and direction == "sell"
+                    price_high_prev = df_m15["high"].iloc[-5:-2].max()
+                    price_high_curr = df_m15["high"].iloc[-2:].max()
+                    hidden_bear = (price_high_curr < price_high_prev) and (rsi_curr > rsi_prev) and direction == "sell"
 
                     if hidden_bull:
                         logger.info(f"📊 HIDDEN DIVERGENCE (No.24): Bullish continuation confirmed (Higher Low + Lower RSI)")
@@ -279,6 +306,24 @@ class AdvancedSignalEngine(SignalEngine):
 
         logger.info(f"Signal FINAL score: {score}/{threshold} (after all bonuses)")
 
+        # ── 6b. Transitional guard: avoid premature trend-following entries ──
+        # If HTF is not yet aligned and LTF is actively opposing HTF, require
+        # extra conviction before allowing trend-following entries.
+        if (
+            TRADING_CONFIG.enable_multi_tf
+            and mtf is not None
+            and reversal_detected
+            and not mtf.htf_aligned
+            and master_dir is not None
+            and direction == master_dir
+            and score < (threshold + 2)
+        ):
+            logger.info(
+                f"⏸️ TRANSITION GUARD: HTF not aligned + LTF opposing {master_bias}. "
+                f"Score {score} below required {threshold + 2} for early {direction.upper()} entry."
+            )
+            return None
+
         if score >= threshold and direction:
             current_price = df_m1["close"].iloc[-1]
             atr_val = (df_m15["high"] - df_m15["low"]).tail(20).mean()
@@ -300,7 +345,8 @@ class AdvancedSignalEngine(SignalEngine):
                 is_extreme = True
             
             # --- SESSION ADAPTIVE PARAMETERS ---
-            session_name = get_session_name(utc_now())
+            event_time = kwargs.get("current_time") or utc_now()
+            session_name = get_session_name(event_time)
             
             # buffer_pips: extra safety distance for the SL
             # Asian = super tight, London = cautious, NY = protective
@@ -399,16 +445,26 @@ class AdvancedSignalEngine(SignalEngine):
                 if target_zone_low - buffer_pips <= current_price <= target_zone_high + buffer_pips:
                     in_zone = True
 
-            # --- MOMENTUM BREAKOUT BYPASS RL ---
-            # If the momentum is exceptionally strong (score >= 12 AND ADX > 30), 
-            # waiting for a pullback might cause us to miss the move entirely.
+            # --- MOMENTUM BREAKOUT BYPASS ---
+            # When fast momentum carries price beyond the structural zone before
+            # we can enter, waiting for a retracement that never comes means a
+            # missed trade.  Fire immediately if score and ADX are both strong.
+            #
+            # Threshold: score >= mode_threshold + 2 (at least 7), ADX > 25.
+            # Applies to MODERATE and above so all non-conservative modes benefit.
             momentum_bypass = False
-            if not in_zone and score >= 12 and best_tf_adx > 30 and mode in (TradeMode.ULTRA_SCALPER, TradeMode.VERY_AGGRESSIVE, TradeMode.AGGRESSIVE):
+            _bypass_score_min = max(threshold + 2, 7)
+            if not in_zone and score >= _bypass_score_min and best_tf_adx > 25 and mode in (
+                TradeMode.ULTRA_SCALPER, TradeMode.VERY_AGGRESSIVE,
+                TradeMode.AGGRESSIVE, TradeMode.MODERATE,
+            ):
                 if signal_key not in self._logged_bypasses:
-                    logger.info(f"🚀 MOMENTUM BYPASS: Score is exceptionally high ({score}/15) and ADX is strong ({best_tf_adx:.1f}). Bypassing Extreme zone requirement.")
-                    if signal_key:
-                        self._logged_bypasses.add(signal_key)
-                
+                    logger.info(
+                        f"🚀 MOMENTUM BYPASS: score={score} (min={_bypass_score_min}) "
+                        f"ADX={best_tf_adx:.1f} — entering without zone retracement."
+                    )
+                    self._logged_bypasses.add(signal_key)
+
                 in_zone = True
                 momentum_bypass = True
             
@@ -438,38 +494,91 @@ class AdvancedSignalEngine(SignalEngine):
             # 4. Calculate safe distance
             min_risk = (df_m1["high"] - df_m1["low"]).tail(20).mean() * 1.5
             
-            if extreme_sl and not momentum_bypass:
+            if extreme_sl:
                 proposed_sl = extreme_sl
-                # Ensure it's not so tight it gets wiped out instantly by spread
-                if not is_extreme:
+                # For normal zone entries: ensure SL is not trivially tight vs spread
+                if not is_extreme and not momentum_bypass:
                     if direction == "buy":
                         proposed_sl = min(proposed_sl, current_price - min_risk)
                     else:
                         proposed_sl = max(proposed_sl, current_price + min_risk)
-                logger.info(f"🎯 1M HIGH PRECISION ENTRY: SL set to {proposed_sl:.2f} (Extreme: {is_extreme})")
+                if momentum_bypass:
+                    logger.info(f"🚀 MOMENTUM ZONE SL: Breakout entry, SL at zone boundary {proposed_sl:.2f}")
+                else:
+                    logger.info(f"🎯 1M HIGH PRECISION ENTRY: SL set to {proposed_sl:.2f} (Extreme: {is_extreme})")
             else:
-                # Fallback to ATR or Recent Swing if no structure found, or if we used Momentum Bypass (to avoid massive SL)
+                # No structural zone found — fallback to ATR/swing
                 swing_risk = min_risk * 1.2
                 if direction == "buy":
                     proposed_sl = current_price - max(atr_val * 1.5, swing_risk)
                 else:
                     proposed_sl = current_price + max(atr_val * 1.5, swing_risk)
-                    
                 if momentum_bypass:
-                    logger.info(f"🚀 MOMENTUM SL SET: Using ATR/Local Swing fallback SL {proposed_sl:.2f} to prevent huge risk on aggressive breakout.")
+                    logger.info(f"🚀 MOMENTUM ATR SL: No zone found, ATR/Swing SL {proposed_sl:.2f}")
                 else:
-                    logger.info(f"🔌 FALLBACK SL SET: No structure found, using ATR/Swing fallback SL {proposed_sl:.2f}")
+                    logger.info(f"🔌 FALLBACK SL SET: No structure, ATR/Swing SL {proposed_sl:.2f}")
 
-            # 5. Take Profit Calculation (Dynamic based on Session & Extreme)
+            # 5. Take Profit Calculation — Fibo extension first, session-RR fallback
             risk_dist = abs(current_price - proposed_sl)
-            # Use session-aware multiplier
             risk_reward_multiplier = 10.0 if is_extreme else session_rr_mult
-            
-            # --- BASE TARGET CALCULATION ---
+
+            # Session-RR baseline (fallback if no clean Fibo swing found)
             if direction == "buy":
-                raw_target = current_price + (risk_dist * risk_reward_multiplier)
+                rr_target = current_price + (risk_dist * risk_reward_multiplier)
             else:
-                raw_target = current_price - (risk_dist * risk_reward_multiplier)
+                rr_target = current_price - (risk_dist * risk_reward_multiplier)
+
+            # Fibo extension TP: derive from H1 (preferred) or M15 swing
+            fibo_tp = None
+            fibo_label = ""
+            try:
+                from core.structure.swing import detect_swings
+                for tf_name, df_tf in (("H1", df_h1), ("M15", df_m15)):
+                    if df_tf is None or len(df_tf) < 50:
+                        continue
+                    sw = detect_swings(df_tf.tail(120))
+                    highs = [s.price for s in sw if s.kind == 'high']
+                    lows  = [s.price for s in sw if s.kind == 'low']
+                    if not (highs and lows):
+                        continue
+                    sh, sl_pt = highs[-1], lows[-1]
+                    if sh <= sl_pt:
+                        continue
+                    rng = sh - sl_pt
+                    if rng < 1.0:
+                        continue
+                    if direction == "buy":
+                        cand_127 = sh + rng * 0.272
+                        cand_161 = sh + rng * 0.618
+                        # If price already past 127.2%, jump to 161.8%
+                        fibo_tp = cand_127 if cand_127 > current_price else cand_161
+                        fibo_label = f"{tf_name} 127.2%" if cand_127 > current_price else f"{tf_name} 161.8%"
+                    else:
+                        cand_127 = sl_pt - rng * 0.272
+                        cand_161 = sl_pt - rng * 0.618
+                        fibo_tp = cand_127 if cand_127 < current_price else cand_161
+                        fibo_label = f"{tf_name} 127.2%" if cand_127 < current_price else f"{tf_name} 161.8%"
+                    break
+            except Exception:
+                pass
+
+            # Use Fibo TP only if it yields structurally-valid RR (≥1.5)
+            if fibo_tp is not None and risk_dist > 0:
+                fibo_rr = abs(fibo_tp - current_price) / risk_dist
+                if fibo_rr >= 1.5:
+                    raw_target = fibo_tp
+                    logger.info(
+                        f"📐 FIBO TP [{fibo_label}] @ {fibo_tp:.2f} (RR {fibo_rr:.2f}) — "
+                        f"overriding session {risk_reward_multiplier}x RR"
+                    )
+                else:
+                    raw_target = rr_target
+                    logger.info(
+                        f"📐 Fibo TP too close (RR {fibo_rr:.2f} < 1.5) — "
+                        f"fallback to session RR {risk_reward_multiplier}x"
+                    )
+            else:
+                raw_target = rr_target
             
             # TP Synchronization: Align with existing trades if available
             anchor_tp = kwargs.get("anchor_tp")
@@ -503,7 +612,7 @@ class AdvancedSignalEngine(SignalEngine):
                 entry_price    = current_price,
                 stop_loss      = proposed_sl,
                 take_profit    = take_profit,
-                rr_ratio       = risk_reward_multiplier,
+                rr_ratio       = final_rr,
                 score          = score,
                 max_score      = 15,
                 atr_pips       = atr_val,

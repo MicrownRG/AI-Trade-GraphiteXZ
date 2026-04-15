@@ -104,23 +104,51 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
     if not account:
         logger.critical("Failed to retrieve account info from MT5 on startup")
         sys.exit(1)
-        
-    balance = account["balance"]
-    logger.info(f"Account: balance={balance:.2f}")
+
+    balance    = account["balance"]
+    account_id = str(account["login"])
+    logger.info(f"Account: #{account_id}  balance={balance:.2f}")
+
+    # ── Load per-account config (DB → .env → default) ─────────────────────────
+    try:
+        from config.config_loader import ConfigLoader
+        ConfigLoader.load(account_id)
+    except Exception as _cfg_err:
+        logger.warning(f"Config load failed — using defaults: {_cfg_err}")
 
     # ── Core components ───────────────────────────────────────────────────────
     portfolio     = Portfolio(balance)
-    
+
+    # ── State repository (daily cooldown persistence) ─────────────────────────
+    from database.state_repo import StateRepository
+    state_repo = StateRepository(account_id)
+
     # ── Initial Sync (Before Telegram/Scanning) ──────────────────────────────
     if not paper:
         # Sync current account state (equity, floating)
         portfolio.sync_actual_account(account["balance"], account["equity"])
-        
+
         # Calculate daily start reference point to handle restarts accurately
         daily_realized = mt5.get_daily_realized_pnl()
         day_start_ref = account["balance"] - daily_realized
         portfolio.record_day_start(custom_balance=day_start_ref)
-        
+
+        # Restore today's cooldown state (protections survive bot restarts)
+        _saved_state = state_repo.load()
+        if _saved_state:
+            import core.risk.filters as _filters
+            if _saved_state.get("daily_cutloss_triggered"):
+                portfolio.daily_cutloss_triggered = True
+                logger.warning("Restored: daily_cutloss_triggered=True from DB — trading halted")
+            if _saved_state.get("pulse_suspended_today"):
+                portfolio.pulse_suspended_today = True
+                logger.info("Restored: pulse_suspended_today=True from DB")
+            if _saved_state.get("pulse_consecutive_losses"):
+                portfolio.pulse_consecutive_losses = _saved_state["pulse_consecutive_losses"]
+            if _saved_state.get("revenge_cooldown_cleared_at"):
+                _filters.GLOBAL_COOLDOWN_CLEARED_AT = _saved_state["revenge_cooldown_cleared_at"]
+                logger.info(f"Restored: GLOBAL_COOLDOWN_CLEARED_AT={_filters.GLOBAL_COOLDOWN_CLEARED_AT}")
+
         # Count trades since 00:00 (via MT5Client — Linux-safe)
         deals = mt5.get_daily_deals_today()
         if deals:
@@ -174,6 +202,8 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
     # ── Order manager (with telegram wired in) ────────────────────────────────
     order_manager = OrderManager(mt5, portfolio, repo, telegram=telegram)
     telegram.order_manager = order_manager
+    telegram.account_id    = account_id   # expose for /config command
+    telegram.state_repo    = state_repo   # expose for /reset cooldown persistence
 
     # ── Reconcile positions on startup ────────────────────────────────────────
     pos_manager = PositionManager(mt5, portfolio, repo)
@@ -195,6 +225,12 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
     df_m1        = None
     _last_performance_time = 0
     _last_trend_update_time = time.time()  # Initialize timing for recurring updates
+
+    # News/sentiment cache — updated in full-scan block and consumed on every
+    # tick by monitor_and_manage() so profit-lock / sentiment exit can act even
+    # between full scans.
+    _cached_news_active:    bool           = False
+    _cached_news_sentiment: Optional[str]  = None
     
     # Cache account_id for snapshots
     acc_info = mt5.get_account_info()
@@ -320,9 +356,10 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                 _htf_bias_for_monitor   = _cached_mtf_for_monitor.master_bias if _cached_mtf_for_monitor else None
                 order_manager.monitor_and_manage(
                     price,
-                    df_m15      = df_m15_cache,
-                    htf_bias    = _htf_bias_for_monitor,
-                    news_active = False,  # updated below in full scan
+                    df_m15         = df_m15_cache,
+                    htf_bias       = _htf_bias_for_monitor,
+                    news_active    = _cached_news_active,
+                    news_sentiment = _cached_news_sentiment,
                 )
 
                 # Update account info real-time for true equity tracking
@@ -341,6 +378,8 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                                 f"{portfolio.realized_daily_loss_pct:.1f}%\\. "
                                 f"All positions closed\\. Trading halted for today\\."
                             )
+                            # Persist cutloss state so it survives a bot restart today
+                            state_repo.save_from_portfolio(portfolio)
                     else:
                         portfolio.update_equity(account["equity"] - account["balance"])
             
@@ -428,18 +467,77 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                 continue
                 
             margin_level = account.get("margin_level", 1000.0)
-            # Prefer Redis (Go scraper) for news; fall back to CalendarAPI HTTP feed
-            news_active = _news_client.is_news_active()
-            if not news_active:
-                # Also check sentiment — if bearish/bullish XAU news is active flag it
-                dom_sentiment = _news_client.get_dominant_sentiment()
-            else:
-                dom_sentiment = None
+            # Prefer Redis (Go scraper) for news; fall back to CalendarAPI HTTP feed.
+            # Sentiment is ALWAYS computed (independent of news_active) so that
+            # quiet-period bias from recent events still informs exit decisions.
+            news_active   = _news_client.is_news_active()
+            dom_sentiment = _news_client.get_dominant_sentiment()
             # Legacy fallback when Redis scraper has not run yet
             if _news_client.last_scrape_age_minutes() is None:
                 events      = calendar.get_high_impact_events()
                 news_active = calendar.is_news_active(events)
+
+            # Update tick-level cache consumed by monitor_and_manage()
+            _cached_news_active    = news_active
+            _cached_news_sentiment = dom_sentiment
             
+            # ── Contra-Flip (after structural contra-exit) ───────────────────
+            # If the previous monitor cycle cut a losing trade because HTF bias
+            # flipped, execute an immediate entry in the new bias direction.
+            # This flip bypasses the anti-revenge cooldown (it follows the market).
+            if not paper:
+                _flip = order_manager.pop_contra_flip()
+                if _flip is not None:
+                    _flip_age = (utc_now() - _flip["queued_at"]).total_seconds()
+                    if _flip_age <= 120 and df_m1 is not None:  # only valid for 2 minutes
+                        from core.signal.signal_engine import TradeSignal as _TS
+                        from utils.time_utils import get_session_name as _gsn
+                        _fd        = _flip["direction"]
+                        _fp        = price
+                        _atr_m1    = (df_m1["high"] - df_m1["low"]).tail(20).mean()
+                        _flip_sl   = (_fp - _atr_m1 * 2.0) if _fd == "buy" else (_fp + _atr_m1 * 2.0)
+                        _flip_risk = abs(_fp - _flip_sl)
+                        _flip_tp   = (_fp + _flip_risk * 2.0) if _fd == "buy" else (_fp - _flip_risk * 2.0)
+                        _flip_sig  = _TS(
+                            signal_id       = f"FLIP_{str(__import__('uuid').uuid4())[:6]}",
+                            symbol          = SYMBOL,
+                            timestamp       = utc_now(),
+                            direction       = _fd,
+                            entry_price     = _fp,
+                            stop_loss       = _flip_sl,
+                            take_profit     = _flip_tp,
+                            rr_ratio        = 2.0,
+                            score           = 8,
+                            max_score       = 15,
+                            atr_pips        = _atr_m1 / 0.1,
+                            session         = _gsn(utc_now()),
+                            is_extreme      = False,
+                            is_stalking     = False,
+                            stalking_reason = "",
+                            ai_decision     = "TAKE",
+                            ai_confidence   = 0.75,
+                            ai_reason       = f"Contra-flip: HTF bias is now {_flip['htf_bias']} post contra-exit",
+                        )
+                        _flip_spread = (tick["spread"] / 10.0) if tick and "spread" in tick else 3.0
+                        _flip_order = risk_executor.evaluate(
+                            signal=_flip_sig, df_m15=df_m15_cache, df_m5=df_m5, df_m1=df_m1,
+                            swings=[], spread_pips=_flip_spread,
+                            current_time=now.replace(tzinfo=None),
+                            trades_today=trades_today, margin_level=margin_level, news_active=news_active,
+                        )
+                        if _flip_order and _flip_order.approved:
+                            tid = order_manager.execute(_flip_order, signal_meta={
+                                "score": 8, "session": _flip_sig.session,
+                                "strategy": f"↩️ Contra-Flip ({_fd.upper()})",
+                            }, df_m15=df_m15_cache, df_m5=df_m5)
+                            if tid:
+                                trades_today += 1
+                                logger.info(f"↩️ Contra-flip executed: {_fd.upper()} after structural contra-exit")
+                        else:
+                            logger.info(f"↩️ Contra-flip rejected: {_flip_order.rejection_reason if _flip_order else 'no order'}")
+                    elif _flip_age > 120:
+                        logger.debug("Contra-flip expired (>2 min) — discarded")
+
             # ── Pulse Scalping ───────────────────
             if ("all" in allowed_strategies or "pulse" in allowed_strategies) and tick and not paper:
                 current_spread_pips = (tick["spread"] / 10.0) if "spread" in tick else 3.0
@@ -491,8 +589,13 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                 if reversal_signal and not paper:
                     rev_ai = ai_scorer.evaluate(reversal_signal)
                     reversal_signal.ai_confidence = rev_ai.confidence
-                    reversal_signal.ai_reason     = rev_ai.reason  # Use AI's actual reason
-                    if rev_ai.decision == "TAKE":  # explicit approval required
+                    reversal_signal.ai_reason     = rev_ai.reason
+                    if rev_ai.decision != "TAKE":
+                        logger.info(
+                            f"🔄 Reversal {reversal_signal.signal_id} rejected by AI: "
+                            f"conf={rev_ai.confidence:.2f} decision={rev_ai.decision} | {rev_ai.reason[:80]}"
+                        )
+                    else:
                         rev_swings = detect_swings(df_m15_cache) if df_m15_cache is not None else []
                         rev_spread = (tick["spread"] / 10.0) if tick and "spread" in tick else 3.0
                         rev_order = risk_executor.evaluate(
@@ -513,6 +616,11 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                             if tid:
                                 trades_today += 1
                                 logger.info(f"⚡ Reversal Engine executed: {reversal_signal.signal_id}")
+                        else:
+                            logger.info(
+                                f"🔄 Reversal {reversal_signal.signal_id} blocked by risk executor: "
+                                f"{rev_order.rejection_reason if rev_order else 'no order returned'}"
+                            )
 
             # ── Fibonacci MTF Engine ─────────────────────────────────────────
             if ("all" in allowed_strategies or "fibo" in allowed_strategies) and df_m15_cache is not None and df_m5 is not None and df_m1 is not None and not paper:
@@ -649,7 +757,7 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                             tid = order_manager.execute(order, signal_meta={
                                 "score": signal.score, "session": signal.session,
                                 "ai_confidence": signal.ai_confidence, "ai_reason": signal.ai_reason,
-                                "strategy": "🛡️ ICT Standard",
+                                "strategy": "🛡️ SMC Standard",
                             }, df_m15=df_m15_cache, df_m5=df_m5)
                             if tid:
                                 trades_today += 1

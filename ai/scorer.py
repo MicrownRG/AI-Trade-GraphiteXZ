@@ -100,8 +100,11 @@ class AIScorer:
         if signal.sweep and signal.displacement:
             raw_conf = min(1.0, raw_conf + 0.10)
 
-        if signal.session not in ("London", "New York", "Overlap", "Asian"):
-            raw_conf *= 0.70
+        # Canonical session names from get_session_name(): "LONDON", "NY", "ASIA", "TRANSITION"
+        # Apply a soft confidence penalty only for off-session setups (transition / dead hours).
+        # All active sessions (LONDON, NY, ASIA) are valid — do not penalize them.
+        if signal.session not in ("LONDON", "NY", "ASIA"):
+            raw_conf *= 0.80
 
         if signal.htf_bias and signal.htf_bias.confidence >= 0.80:
             raw_conf = min(1.0, raw_conf + 0.05)

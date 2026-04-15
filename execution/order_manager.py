@@ -56,6 +56,8 @@ class OrderManager:
         self.telegram       = telegram
         self.smc            = SMCLogic()
         self.chart_renderer = ChartRenderer()
+        # Set by check_structural_contra_exit; consumed by main loop for flip entry
+        self._pending_contra_flip: Optional[dict] = None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -471,14 +473,35 @@ class OrderManager:
         )
         self.close_by_ticket(ticket, "structural_contra_exit")
 
+        # Queue a contra-flip so the main loop can immediately open in the opposite
+        # direction.  The flip bypasses the anti-revenge cooldown because the new
+        # entry follows the bias — it is not revenge trading.
+        flip_dir = "buy" if direction == "sell" else "sell"
+        self._pending_contra_flip = {
+            "direction":  flip_dir,
+            "htf_bias":   htf_bias,
+            "ref_price":  current_price,
+            "queued_at":  datetime.now(timezone.utc),
+        }
+        logger.info(f"Contra-flip queued: {flip_dir.upper()} following HTF {htf_bias}")
+
         if self.telegram:
             self.telegram.send_message(
                 f"🔄 *Structural Contra-Exit*\n"
                 f"Trade `{trade_id}` \\({direction.upper()}\\) cut early\\.\n"
                 f"HTF bias flipped to *{htf_bias}* while in loss \\(${current_pnl:.2f}\\)\\.\n"
-                f"_TP recalibration flagged for next signal\\._"
+                f"↩️ Contra-flip *{flip_dir.upper()}* queued for next scan\\."
             )
         return True
+
+    def pop_contra_flip(self) -> Optional[dict]:
+        """
+        Return and clear the pending contra-flip dict, or None if none is queued.
+        Called by the main loop after each full data scan.
+        """
+        flip = self._pending_contra_flip
+        self._pending_contra_flip = None
+        return flip
 
     # ─────────────────────────────────────────────────────────────────────────
     # Main monitoring loop (called on every tick)
@@ -490,13 +513,19 @@ class OrderManager:
         df_m15: Optional[pd.DataFrame] = None,
         htf_bias: Optional[str] = None,
         news_active: bool = False,
+        news_sentiment: Optional[str] = None,
     ) -> None:
         """
         Called on every new tick.
         Applies trailing stop (SL+), breakeven, partial close, and exit logic.
 
-        htf_bias: latest higher-timeframe bias string ("BULLISH" | "BEARISH")
-                  passed in from the main loop so contra-exit can evaluate it.
+        htf_bias:       latest higher-timeframe bias ("BULLISH" | "BEARISH" | "NEUTRAL")
+                        passed in from the main loop so contra-exit can evaluate it.
+        news_active:    True while any 3★ event is within ±30min.
+        news_sentiment: aggregated XAU sentiment from scraped news:
+                        "bullish_xau" | "bearish_xau" | "neutral" | None.
+                        Drives quick-harvest on adverse news and HTF-flip exit
+                        for winning trades (staircase equity protection).
         """
         if self.check_weekend_shutdown():
             return
@@ -508,6 +537,18 @@ class OrderManager:
         settings = TRADING_CONFIG.mode_settings.get(mode, {})
         be_r     = settings.get("be_threshold_r", _DEFAULT_BE_R)
         trail_p  = settings.get("trailing_pips",  40.0)
+
+        # Profit-lock fields (per-mode, from trading_config.py)
+        micro_lock_r       = settings.get("micro_profit_lock_r",       0.0)
+        micro_lock_buf     = settings.get("micro_lock_buffer_pips",    1.0)
+        quick_harvest_news = settings.get("quick_harvest_on_adverse_news", False)
+        news_tp_mult       = settings.get("news_aligned_tp_mult",      1.0)
+
+        # Tighten trailing when news is active (volatility spike protection)
+        # News-aligned sentiment keeps normal trail; adverse sentiment tightens ×0.6.
+        effective_trail_p = trail_p
+        if news_active:
+            effective_trail_p = trail_p * 0.7
 
         for trade_id, trade in list(self.portfolio.open_trades.items()):
             direction = trade["direction"]
@@ -598,6 +639,124 @@ class OrderManager:
             # ── SL guard: skip if no SL set ───────────────────────────────────
             if sl is None or sl == 0:
                 continue
+
+            # ── Quick-harvest on adverse news sentiment ───────────────────────
+            # Close any in-profit trade immediately when XAU sentiment flips
+            # against it.  This guarantees "profit meski kecil" — we never give
+            # back a winner to an adverse news reaction.
+            if quick_harvest_news and news_sentiment and current_pnl > 0:
+                adverse = (
+                    (direction == "buy"  and news_sentiment == "bearish_xau") or
+                    (direction == "sell" and news_sentiment == "bullish_xau")
+                )
+                if adverse:
+                    pnl = current_pnl
+                    ct  = self._close_trade(trade_id, trade, current_price, pnl, "adverse_news_harvest")
+                    logger.info(
+                        f"Quick-harvest adverse news: {trade_id} {direction.upper()} "
+                        f"closed at ${pnl:.2f} (sentiment={news_sentiment})"
+                    )
+                    if self.telegram:
+                        self.telegram.notify_trade_closed(ct)
+                    continue
+
+            # ── HTF-flip quick-harvest (winning trade) ────────────────────────
+            # Extends structural_contra_exit: if HTF bias flipped against an
+            # already-profitable trade, lock the profit now rather than wait
+            # for the trail to stop it out lower.
+            if htf_bias and current_pnl > 0:
+                against = (
+                    (direction == "buy"  and htf_bias == "BEARISH") or
+                    (direction == "sell" and htf_bias == "BULLISH")
+                )
+                # Only fire when profit is "meaningful" — at or past the
+                # micro-lock threshold (so tiny blips don't close the trade).
+                risk = abs(entry - sl)
+                if against and risk > 0:
+                    prof = (
+                        (current_price - entry) if direction == "buy"
+                        else (entry - current_price)
+                    )
+                    if prof >= risk * max(micro_lock_r, 0.15):
+                        pnl = current_pnl
+                        ct  = self._close_trade(trade_id, trade, current_price, pnl, "htf_flip_harvest")
+                        logger.info(
+                            f"HTF-flip harvest: {trade_id} {direction.upper()} "
+                            f"closed at ${pnl:.2f} (HTF now {htf_bias})"
+                        )
+                        if self.telegram:
+                            self.telegram.notify_trade_closed(ct)
+                        continue
+
+            # ── Micro-profit-lock ratchet ─────────────────────────────────────
+            # Before the heavier BE logic, guarantee that any trade which
+            # reaches micro_profit_lock_r never returns to a losing SL.
+            # SL → entry + tiny buffer (0.5–2.0 pips depending on mode).
+            # This creates the staircase equity curve the strategy targets.
+            if micro_lock_r > 0 and not trade.get("micro_locked") and not be_active:
+                risk = abs(entry - sl)
+                if risk > 0:
+                    profit = (
+                        (current_price - entry) if direction == "buy"
+                        else (entry - current_price)
+                    )
+                    if profit >= risk * micro_lock_r:
+                        # pip = 0.1 for XAU/USD
+                        buf_price = micro_lock_buf * 0.1
+                        new_sl = (entry + buf_price) if direction == "buy" else (entry - buf_price)
+
+                        # Only move SL if it actually improves (toward entry + buffer)
+                        improves = (
+                            (direction == "buy"  and new_sl > sl) or
+                            (direction == "sell" and new_sl < sl)
+                        )
+                        if improves:
+                            trade["stop_loss"]    = new_sl
+                            trade["micro_locked"] = True
+                            sl = new_sl  # update local for subsequent blocks
+
+                            ticket = trade.get("mt5_ticket")
+                            if ticket:
+                                res = self.mt5.modify_position(ticket, sl=new_sl)
+                                if isinstance(res, dict) and res.get("error"):
+                                    logger.warning(
+                                        f"Micro-lock SL modify failed for #{ticket}: "
+                                        f"{res.get('comment')} — virtual SL enforced"
+                                    )
+                            logger.info(
+                                f"Micro-profit-lock: {trade_id} SL -> {new_sl:.2f} "
+                                f"(profit {profit:.2f} >= {micro_lock_r:.2f}R)"
+                            )
+
+            # ── News-aligned TP boost (one-shot per trade) ────────────────────
+            # When sentiment + HTF both confirm the signal direction, extend the
+            # TP so winners run further on momentum.
+            if (
+                news_tp_mult > 1.0 and
+                not trade.get("tp_boosted") and
+                news_sentiment and htf_bias and
+                trade.get("take_profit")
+            ):
+                aligned = (
+                    (direction == "buy"  and news_sentiment == "bullish_xau" and htf_bias == "BULLISH") or
+                    (direction == "sell" and news_sentiment == "bearish_xau" and htf_bias == "BEARISH")
+                )
+                if aligned:
+                    old_tp = trade["take_profit"]
+                    risk   = abs(entry - sl) if sl else 0
+                    if risk > 0:
+                        # extend TP by (mult-1) * risk in the trade direction
+                        extra = risk * (news_tp_mult - 1.0)
+                        new_tp = (old_tp + extra) if direction == "buy" else (old_tp - extra)
+                        trade["take_profit"] = new_tp
+                        trade["tp_boosted"]  = True
+                        ticket = trade.get("mt5_ticket")
+                        if ticket:
+                            self.mt5.modify_position(ticket, tp=new_tp)
+                        logger.info(
+                            f"News-aligned TP boost: {trade_id} TP {old_tp:.2f} -> {new_tp:.2f} "
+                            f"(×{news_tp_mult:.2f}, sentiment={news_sentiment} HTF={htf_bias})"
+                        )
 
             # ── Breakeven activation ──────────────────────────────────────────
             if not be_active:
@@ -693,7 +852,10 @@ class OrderManager:
                     (direction == "sell" and current_price <= tp1)
                 )
                 if tp1_hit:
-                    partial_vol = round((lot / 2.0) / RISK_CONFIG.lot_step) * RISK_CONFIG.lot_step
+                    # Profile-aware partial fraction (30% CONS → 70% ULTRA)
+                    pc_frac = settings.get("partial_close_fraction", 0.5)
+                    pc_frac = max(0.10, min(0.90, pc_frac))  # safety clamp
+                    partial_vol = round((lot * pc_frac) / RISK_CONFIG.lot_step) * RISK_CONFIG.lot_step
                     partial_vol = max(RISK_CONFIG.min_lot_size, partial_vol)
 
                     if partial_vol < lot:
@@ -763,7 +925,7 @@ class OrderManager:
                     current_price = current_price,
                     current_sl    = sl,
                     direction     = direction,
-                    trail_pips    = trail_p,
+                    trail_pips    = effective_trail_p,
                 )
 
                 # Only push to MT5 if SL moved at least 0.5 points (avoid API spam)
@@ -774,7 +936,7 @@ class OrderManager:
                         self.mt5.modify_position(ticket, sl=new_sl)
                         logger.info(
                             f"Trailing SL (SL+) moved: {trade_id} MT5#{ticket} "
-                            f"SL -> {new_sl:.2f} (trail {trail_p:.0f} pips)"
+                            f"SL -> {new_sl:.2f} (trail {effective_trail_p:.0f} pips)"
                         )
 
             # ── SL hit ────────────────────────────────────────────────────────

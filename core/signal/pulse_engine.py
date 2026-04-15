@@ -217,15 +217,39 @@ class PulseEngine:
             logger.debug("Pulse: SL distance < 0.5 points — skip.")
             return None
 
-        # 8. TP calculation — conservative RR multiplier
-        # Asian (ranging): 1.5x RR — smaller target, more likely to be hit
-        # Other calm sessions: 2.5x RR — slightly more ambitious
+        # 8. TP calculation — Fibo extension (preferred), session RR fallback
         rr_multiplier = 1.5 if is_asian else 2.5
+        tp_rr = (curr_close + risk_dist * rr_multiplier) if signal_dir == "buy" \
+                else (curr_close - risk_dist * rr_multiplier)
 
-        if signal_dir == "buy":
-            tp = curr_close + (risk_dist * rr_multiplier)
-        else:
-            tp = curr_close - (risk_dist * rr_multiplier)
+        # Derive Fibo TP from M5 swing (Pulse operates on M1 extreme → M5 context)
+        tp = tp_rr
+        try:
+            from core.structure.swing import detect_swings
+            sw = detect_swings(df_m5.tail(80))
+            highs = [s.price for s in sw if s.kind == 'high']
+            lows  = [s.price for s in sw if s.kind == 'low']
+            if highs and lows:
+                sh, sl_pt = highs[-1], lows[-1]
+                if sh > sl_pt:
+                    rng = sh - sl_pt
+                    if rng >= 0.5:
+                        if signal_dir == "buy":
+                            cand = sh + rng * 0.272
+                            fibo_tp = cand if cand > curr_close else (sh + rng * 0.618)
+                        else:
+                            cand = sl_pt - rng * 0.272
+                            fibo_tp = cand if cand < curr_close else (sl_pt - rng * 0.618)
+                        fibo_rr = abs(fibo_tp - curr_close) / risk_dist if risk_dist > 0 else 0
+                        # Use Fibo TP if RR ∈ [1.2, 3.5] — keep Pulse conservative
+                        if 1.2 <= fibo_rr <= 3.5:
+                            tp = fibo_tp
+                            logger.info(
+                                f"📐 PULSE Fibo TP @ {fibo_tp:.2f} (RR {fibo_rr:.2f}) — "
+                                f"overrides session {rr_multiplier}x"
+                            )
+        except Exception:
+            pass
 
         # TP synchronisation: align with existing trades if anchor is further
         anchor_tp = kwargs.get("anchor_tp")

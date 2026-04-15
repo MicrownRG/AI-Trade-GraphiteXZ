@@ -54,21 +54,13 @@ def fetch_batch_mt5(
     Returns a dictionary mapping timeframe name to its DataFrame.
     """
     results = {}
-    with ThreadPoolExecutor(max_workers=min(len(timeframes), 10)) as executor:
-        # Create a mapping of future to TF string
-        future_to_tf = {
-            executor.submit(fetch_from_mt5, mt5_client, symbol, tf, count): tf
-            for tf in timeframes
-        }
-        
-        for future in as_completed(future_to_tf):
-            tf = future_to_tf[future]
-            try:
-                df = future.result()
-                if not df.empty:
-                    results[tf.lower()] = df
-            except Exception as e:
-                logger.error(f"Parallel fetch failed for {tf}: {e}")
+    for tf in timeframes:
+        try:
+            df = fetch_from_mt5(mt5_client, symbol, tf, count)
+            if not df.empty:
+                results[tf.lower()] = df
+        except Exception as e:
+            logger.error(f"Sequential fetch failed for {tf}: {e}")
                 
     return results
 

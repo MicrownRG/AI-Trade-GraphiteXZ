@@ -20,7 +20,7 @@ from core.structure import (
 from config.trading_config import TRADING_CONFIG
 from config.risk_config import RISK_CONFIG
 from utils.logger import get_logger
-from utils.time_utils import is_valid_session
+from utils.time_utils import is_valid_session, get_session_name
 
 logger = get_logger(__name__)
 
@@ -98,8 +98,8 @@ class SignalEngine:
 
 
         # ── 2. Session filter ─────────────────────────────────────────────────
-        session = _get_session(current_time)
-        session_valid = session in ("London", "New York", "Overlap", "Asian")
+        session = get_session_name(current_time)
+        session_valid = session in ("LONDON", "NY", "ASIA")
 
         # ── 3. ATR / Volatility ───────────────────────────────────────────────
         atr_series = atr(df_ltf, TRADING_CONFIG.atr_period)
@@ -152,6 +152,22 @@ class SignalEngine:
                     score = sum(breakdown.values())
         except Exception:
             pass  # adaptive layer is best-effort; never block a signal
+
+        # ── 7c. News sentiment bias ──────────────────────────────────────────
+        # XAU sentiment from Go scraper: align → +1 score, oppose → −2 score.
+        # Stronger penalty than bonus because trading into a sentiment wall
+        # has historically been the costlier error.
+        try:
+            from core.data.news_redis import news_client as _nc_bias
+            _sentiment = _nc_bias.get_dominant_sentiment()
+            _dir_bull  = (htf_bias and htf_bias.direction == "bullish")
+            if _sentiment == "bullish_xau":
+                score += 1 if _dir_bull else -2
+            elif _sentiment == "bearish_xau":
+                score += -2 if _dir_bull else 1
+            score = max(0, score)
+        except Exception:
+            pass
 
         if score < RISK_CONFIG.min_signal_score:
             logger.debug(f"Signal score {score} below threshold {RISK_CONFIG.min_signal_score}")
@@ -241,19 +257,4 @@ def _choch_aligns_bias(choch: CHOCHEvent, bias: HTFBias) -> bool:
     return choch.direction == bias.direction
 
 
-def _get_session(dt: datetime) -> str:
-    hour = dt.hour
-    cfg  = TRADING_CONFIG
-    in_london = cfg.london_session[0] <= hour < cfg.london_session[1]
-    in_ny     = cfg.ny_session[0]     <= hour < cfg.ny_session[1]
-    in_asian  = cfg.asian_session[0]  <= hour < cfg.asian_session[1]
 
-    if in_london and in_ny:
-        return "Overlap"
-    if in_london:
-        return "London"
-    if in_ny:
-        return "New York"
-    if in_asian:
-        return "Asian"
-    return "Off-Hours"

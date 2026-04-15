@@ -6,6 +6,7 @@ never imports MetaTrader5 directly.
 """
 from __future__ import annotations
 import time
+import math
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 
@@ -175,6 +176,43 @@ class MT5Client:
             logger.error(f"Cannot get tick for {symbol}")
             return None
 
+        # ── Volume normalization against broker symbol specs ─────────────────
+        # Prevents retcode=10014 Invalid volume when broker's min/step differs
+        # from RISK_CONFIG defaults (e.g. some brokers require 0.1 min lot on XAU).
+        # If upstream already zeroed the lot (risk cap hit), do NOT auto-clamp
+        # back up to broker min — that would bypass the portfolio cap.
+        if lot_size <= 0:
+            logger.warning(f"place_market_order: rejected lot_size={lot_size} (<=0)")
+            return {"error": True, "comment": "Invalid volume (<=0, cap hit)", "retcode": 10014}
+
+        sym_info = mt5.symbol_info(symbol)
+        if sym_info is not None:
+            v_min  = float(getattr(sym_info, "volume_min",  0.01) or 0.01)
+            v_max  = float(getattr(sym_info, "volume_max",  100.0) or 100.0)
+            v_step = float(getattr(sym_info, "volume_step", 0.01) or 0.01)
+            original_lot = lot_size
+            # snap down to nearest step, then clamp to [min, max]
+            if v_step > 0:
+                lot_size = math.floor(lot_size / v_step + 1e-9) * v_step
+            # Only clamp UP to v_min if caller requested ≥ half-min — otherwise
+            # preserve the cap decision (returns 0 → reject above).
+            if lot_size < v_min and original_lot >= v_min * 0.5:
+                lot_size = v_min
+            else:
+                lot_size = min(lot_size, v_max)
+            # avoid float residue like 0.0200000003
+            lot_size = round(lot_size, 2)
+            if lot_size < v_min:
+                logger.warning(
+                    f"place_market_order: requested {original_lot} below broker min {v_min} — rejecting"
+                )
+                return {"error": True, "comment": f"Below broker min {v_min}", "retcode": 10014}
+            if abs(lot_size - original_lot) > 1e-9:
+                logger.info(
+                    f"Volume normalized for {symbol}: {original_lot} -> {lot_size} "
+                    f"(broker min={v_min} max={v_max} step={v_step})"
+                )
+
         order_type = mt5.ORDER_TYPE_BUY if direction == "buy" else mt5.ORDER_TYPE_SELL
         price      = tick.ask if direction == "buy" else tick.bid
 
@@ -284,6 +322,16 @@ class MT5Client:
         # Use actual position symbol/volume if not provided
         _symbol = symbol or p.symbol
         _volume = volume if volume > 0 else p.volume
+
+        # Normalize partial-close volume against broker specs (retcode 10014 guard)
+        sym_info = mt5.symbol_info(_symbol)
+        if sym_info is not None and volume > 0:
+            v_min  = float(getattr(sym_info, "volume_min",  0.01) or 0.01)
+            v_step = float(getattr(sym_info, "volume_step", 0.01) or 0.01)
+            if v_step > 0:
+                _volume = math.floor(_volume / v_step + 1e-9) * v_step
+            _volume = round(max(v_min, min(_volume, p.volume)), 2)
+
         close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
         tick = mt5.symbol_info_tick(_symbol)
         close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask

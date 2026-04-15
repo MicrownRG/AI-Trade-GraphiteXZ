@@ -159,6 +159,14 @@ class Portfolio:
             self.last_trade_opened_at   = trade_info.get("opened_at") or datetime.now(timezone.utc)
             logger.info(f"Portfolio: opened {trade_id}")
 
+    def debit(self, amount: float, note: str = "") -> None:
+        """Subtract fees (commission, swap) from cash balance — not trade PnL."""
+        if amount <= 0:
+            return
+        with self._lock:
+            self.balance -= amount
+            logger.info(f"Portfolio: debit ${amount:.2f} {note} balance=${self.balance:.2f}")
+
     def close_trade(self, ct: ClosedTrade) -> None:
         with self._lock:
             self.balance += ct.pnl
