@@ -140,6 +140,14 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
             if _saved_state.get("daily_cutloss_triggered"):
                 portfolio.daily_cutloss_triggered = True
                 logger.warning("Restored: daily_cutloss_triggered=True from DB — trading halted")
+            else:
+                # Cutloss was reset (DB=False). Offset current MT5 losses so they
+                # don't immediately re-trigger on this restart.
+                portfolio._cutloss_pnl_offset = daily_realized
+                logger.info(
+                    f"Cutloss DB=False: applying PnL offset {daily_realized:.2f} "
+                    f"to prevent re-trigger of pre-reset losses"
+                )
             if _saved_state.get("pulse_suspended_today"):
                 portfolio.pulse_suspended_today = True
                 logger.info("Restored: pulse_suspended_today=True from DB")
@@ -373,11 +381,15 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
 
                         # Hard cutloss check — close all + halt if realized loss >= 5%
                         if order_manager.check_hard_cutloss():
-                            telegram.notifier.send(
-                                f"🔴 *HARD CUTLOSS TRIGGERED*: Realized daily loss hit "
-                                f"{portfolio.realized_daily_loss_pct:.1f}%\\. "
-                                f"All positions closed\\. Trading halted for today\\."
+                            _dd_pct  = portfolio.drawdown_pct
+                            _rl_pct  = portfolio.realized_daily_loss_pct
+                            _msg = (
+                                f"🔴 HARD CUTLOSS TRIGGERED\n"
+                                f"Realized daily loss: {_rl_pct:.1f}%\n"
+                                f"Equity drawdown: {_dd_pct:.1f}%\n"
+                                f"All positions closed. Trading halted for today."
                             )
+                            telegram.notifier.send(_msg, parse_mode="")
                             # Persist cutloss state so it survives a bot restart today
                             state_repo.save_from_portfolio(portfolio)
                     else:
@@ -492,12 +504,59 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                     if _flip_age <= 120 and df_m1 is not None:  # only valid for 2 minutes
                         from core.signal.signal_engine import TradeSignal as _TS
                         from utils.time_utils import get_session_name as _gsn
+                        from core.structure.swing import detect_swings as _ds
                         _fd        = _flip["direction"]
                         _fp        = price
                         _atr_m1    = (df_m1["high"] - df_m1["low"]).tail(20).mean()
-                        _flip_sl   = (_fp - _atr_m1 * 2.0) if _fd == "buy" else (_fp + _atr_m1 * 2.0)
+
+                        # Structural SL: nearest M5 swing extreme (fallback ATR×2)
+                        _flip_sl = None
+                        try:
+                            _fsw = _ds(df_m5.tail(80)) if df_m5 is not None else []
+                            if _fd == "buy":
+                                _lows = [s.price for s in _fsw if s.kind == 'low']
+                                if _lows:
+                                    _flip_sl = min(_lows[-1], _fp - _atr_m1 * 1.2) - _atr_m1 * 0.3
+                            else:
+                                _highs = [s.price for s in _fsw if s.kind == 'high']
+                                if _highs:
+                                    _flip_sl = max(_highs[-1], _fp + _atr_m1 * 1.2) + _atr_m1 * 0.3
+                        except Exception:
+                            pass
+                        if _flip_sl is None:
+                            _flip_sl = (_fp - _atr_m1 * 2.0) if _fd == "buy" else (_fp + _atr_m1 * 2.0)
                         _flip_risk = abs(_fp - _flip_sl)
-                        _flip_tp   = (_fp + _flip_risk * 2.0) if _fd == "buy" else (_fp - _flip_risk * 2.0)
+
+                        # Fibo TP: 127.2% ext from nearest H1/M15 swing, fallback RR 2.0
+                        _flip_tp = None
+                        try:
+                            for _df_tf in (df_h1, df_m15_cache):
+                                if _df_tf is None or len(_df_tf) < 50:
+                                    continue
+                                _sw = _ds(_df_tf.tail(120))
+                                _hs = [s.price for s in _sw if s.kind == 'high']
+                                _ls = [s.price for s in _sw if s.kind == 'low']
+                                if not (_hs and _ls):
+                                    continue
+                                _sh, _sl = _hs[-1], _ls[-1]
+                                if _sh <= _sl:
+                                    continue
+                                _rng = _sh - _sl
+                                if _fd == "buy":
+                                    _c127 = _sh + _rng * 0.272
+                                    _cand = _c127 if _c127 > _fp else (_sh + _rng * 0.618)
+                                else:
+                                    _c127 = _sl - _rng * 0.272
+                                    _cand = _c127 if _c127 < _fp else (_sl - _rng * 0.618)
+                                _cand_rr = abs(_cand - _fp) / _flip_risk if _flip_risk > 0 else 0
+                                if 1.5 <= _cand_rr <= 5.0:
+                                    _flip_tp = _cand
+                                    logger.info(f"↩️ FLIP Fibo TP @ {_cand:.2f} (RR {_cand_rr:.2f})")
+                                    break
+                        except Exception:
+                            pass
+                        if _flip_tp is None:
+                            _flip_tp = (_fp + _flip_risk * 2.0) if _fd == "buy" else (_fp - _flip_risk * 2.0)
                         _flip_sig  = _TS(
                             signal_id       = f"FLIP_{str(__import__('uuid').uuid4())[:6]}",
                             symbol          = SYMBOL,
@@ -506,7 +565,7 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                             entry_price     = _fp,
                             stop_loss       = _flip_sl,
                             take_profit     = _flip_tp,
-                            rr_ratio        = 2.0,
+                            rr_ratio        = round(abs(_flip_tp - _fp) / _flip_risk, 2) if _flip_risk > 0 else 2.0,
                             score           = 8,
                             max_score       = 15,
                             atr_pips        = _atr_m1 / 0.1,
@@ -537,6 +596,57 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                             logger.info(f"↩️ Contra-flip rejected: {_flip_order.rejection_reason if _flip_order else 'no order'}")
                     elif _flip_age > 120:
                         logger.debug("Contra-flip expired (>2 min) — discarded")
+
+            # ── Post-TP Re-entry ─────────────────────────────────────────
+            # After a trade hits TP, check if price continues (same dir) or
+            # flips (opposite) — immediate re-entry opportunity.
+            if not paper and price:
+                _tp_re = order_manager.consume_tp_reentry(
+                    current_price=price,
+                    htf_bias=_htf_bias_for_monitor or "",
+                )
+                if _tp_re is not None:
+                    from core.signal.signal_engine import TradeSignal as _TS
+                    from utils.time_utils import get_session_name as _gsn
+                    _re_risk = abs(_tp_re["entry_price"] - _tp_re["stop_loss"])
+                    _re_rr = abs(_tp_re["take_profit"] - _tp_re["entry_price"]) / _re_risk if _re_risk > 0 else 2.0
+                    _re_sig = _TS(
+                        signal_id       = f"RETP_{str(__import__('uuid').uuid4())[:6]}",
+                        symbol          = _tp_re["symbol"],
+                        timestamp       = utc_now(),
+                        direction       = _tp_re["direction"],
+                        entry_price     = _tp_re["entry_price"],
+                        stop_loss       = _tp_re["stop_loss"],
+                        take_profit     = _tp_re["take_profit"],
+                        rr_ratio        = round(_re_rr, 2),
+                        score           = 7,
+                        max_score       = 15,
+                        atr_pips        = _re_risk / 0.1,
+                        session         = _gsn(utc_now()),
+                        is_extreme      = False,
+                        is_stalking     = False,
+                        stalking_reason = "",
+                        ai_decision     = "TAKE",
+                        ai_confidence   = 0.70,
+                        ai_reason       = _tp_re["reason"],
+                    )
+                    _re_spread = (tick["spread"] / 10.0) if tick and "spread" in tick else 3.0
+                    _re_order = risk_executor.evaluate(
+                        signal=_re_sig, df_m15=df_m15_cache, df_m5=df_m5, df_m1=df_m1,
+                        swings=[], spread_pips=_re_spread,
+                        current_time=now.replace(tzinfo=None),
+                        trades_today=trades_today, margin_level=margin_level, news_active=news_active,
+                    )
+                    if _re_order and _re_order.approved:
+                        tid = order_manager.execute(_re_order, signal_meta={
+                            "score": 7, "session": _re_sig.session,
+                            "strategy": f"⚡ Post-TP {_tp_re['reason']}",
+                        }, df_m15=df_m15_cache, df_m5=df_m5)
+                        if tid:
+                            trades_today += 1
+                            logger.info(f"⚡ Post-TP re-entry executed: {_tp_re['direction'].upper()} ({_tp_re['reason']})")
+                    else:
+                        logger.info(f"⚡ Post-TP re-entry rejected: {_re_order.rejection_reason if _re_order else 'no order'}")
 
             # ── Pulse Scalping ───────────────────
             if ("all" in allowed_strategies or "pulse" in allowed_strategies) and tick and not paper:
@@ -753,11 +863,25 @@ def run_live(paper: bool = False, allowed_strategies: list[str] = None) -> None:
                             risk_pct_override=telegram.get_current_risk_pct()
                         )
 
+                        if order and not order.approved:
+                            logger.warning(
+                                f"🚫 SMC REJECTED: {order.rejection_reason} "
+                                f"| signal={signal.signal_id} score={signal.score}"
+                            )
                         if order and order.approved:
+                            # Apply tier-based lot multiplier (THIN_RETRACE = 0.5x)
+                            if getattr(signal, "lot_multiplier", 1.0) < 1.0:
+                                order.lot_size = round(
+                                    order.lot_size * signal.lot_multiplier, 2
+                                )
+                                logger.info(
+                                    f"📉 SMC tier {getattr(signal, 'entry_tier', 'ZONE')}: "
+                                    f"lot scaled x{signal.lot_multiplier} → {order.lot_size}"
+                                )
                             tid = order_manager.execute(order, signal_meta={
                                 "score": signal.score, "session": signal.session,
                                 "ai_confidence": signal.ai_confidence, "ai_reason": signal.ai_reason,
-                                "strategy": "🛡️ SMC Standard",
+                                "strategy": f"🛡️ SMC Standard ({getattr(signal, 'entry_tier', 'ZONE')})",
                             }, df_m15=df_m15_cache, df_m5=df_m5)
                             if tid:
                                 trades_today += 1

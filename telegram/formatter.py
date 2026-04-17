@@ -101,7 +101,7 @@ def fmt_trade_entry(
     msg += (
         f"📐 RR    `1:{rr:.2f}`\n\n"
         f"📦 Lot       `{lot_size}`\n"
-        f"💸 Risk      `${risk_amount:.2f}`  \\({risk_pct:.2f}%\\)\n"
+        f"💸 Risk      `${risk_amount:.2f}  ({risk_pct:.2f}%)`\n"
         f"📊 Score     `{signal_score}/{max_score}`\n"
         f"🕓 Session   `{_escape(session)}`\n"
     )
@@ -288,7 +288,7 @@ def fmt_daily_summary(
     return (
         f"📊 *DAILY SUMMARY — {_escape(date_str)}*\n"
         f"{'─' * 15}\n"
-        f"{pnl_emoji} PnL:        *{'\\+' if total_pnl >= 0 else '\\-'}${abs(total_pnl):.2f}*\n"
+        f"{pnl_emoji} PnL:        `{'+'if total_pnl >= 0 else '-'}${abs(total_pnl):.2f}`\n"
         f"🏦 Balance:   `${ending_balance:,.2f}`\n"
         f"📉 Max DD:    `{max_drawdown_pct:.2f}%`\n\n"
         f"📈 Trades:    `{total_trades}`  \\({wins}W / {losses}L\\)\n"

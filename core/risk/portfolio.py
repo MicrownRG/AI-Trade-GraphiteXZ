@@ -39,7 +39,7 @@ class Portfolio:
         self.open_trades:  dict[str, dict] = {}
         self.closed_trades: List[ClosedTrade] = []
         self._day_start_balance_val: float = initial_balance
-        self._day_start_date: date = date.today()
+        self._day_start_date: date = datetime.now(timezone.utc).date()
 
         # Timing and state used by pre-trade filters
         self.last_trade_closed_at:  Optional[datetime] = None
@@ -52,6 +52,7 @@ class Portfolio:
         self.pulse_consecutive_losses: int = 0
         self.pulse_suspended_today:    bool = False
         self._true_realized_pnl:       float = 0.0
+        self._cutloss_pnl_offset:     float = 0.0  # offset applied after manual reset
 
         # Hard cutloss state — reset each day in record_day_start()
         self.daily_cutloss_triggered: bool = False
@@ -88,12 +89,14 @@ class Portfolio:
 
     @property
     def realized_daily_loss_pct(self) -> float:
-        """Realized (closed) daily loss as % of day-start balance. Always >= 0."""
+        """Realized (closed) daily loss as % of day-start balance. Always >= 0.
+        After a manual cutloss reset, only NEW losses (post-reset) count."""
         if self._day_start_balance_val <= 0:
             return 0.0
-        if self._true_realized_pnl >= 0:
+        adjusted_pnl = self._true_realized_pnl - self._cutloss_pnl_offset
+        if adjusted_pnl >= 0:
             return 0.0
-        return abs(self._true_realized_pnl) / self._day_start_balance_val * 100
+        return abs(adjusted_pnl) / self._day_start_balance_val * 100
 
     @property
     def realized_pnl(self) -> float:
@@ -129,9 +132,23 @@ class Portfolio:
                 total += pips * lot * 10.0
         return round(total, 2)
 
+    def reset_cutloss(self) -> None:
+        """Full cutloss reset: clear flag + offset PnL so pre-reset losses don't re-trigger.
+        Also reset peak_equity to current equity so drawdown_pct starts fresh."""
+        with self._lock:
+            self.daily_cutloss_triggered = False
+            self._cutloss_pnl_offset = self._true_realized_pnl
+            self.peak_equity = self.equity
+            self._day_start_balance_val = self.balance
+            logger.info(
+                f"Cutloss reset: offset={self._cutloss_pnl_offset:.2f}, "
+                f"new day_start=${self._day_start_balance_val:.2f}, "
+                f"new peak=${self.peak_equity:.2f}"
+            )
+
     def record_day_start(self, custom_balance: float | None = None) -> None:
         """Set the reference balance for daily PnL and drawdown high-water mark."""
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         with self._lock:
             self._day_start_date = today
             if custom_balance is not None:
@@ -146,6 +163,7 @@ class Portfolio:
             self.pulse_suspended_today    = False
             self.pulse_consecutive_losses = 0
             self.daily_cutloss_triggered  = False
+            self._cutloss_pnl_offset     = 0.0  # fresh day, no offset
             logger.info(
                 f"Day start balance set to ${self._day_start_balance_val:.2f} "
                 f"(peak: ${self.peak_equity:.2f})"

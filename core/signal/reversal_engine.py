@@ -50,13 +50,16 @@ RECOVERY_ATR_RATIO       = 1.2   # Scenario 2: ATR must cool below this ratio fo
 RECOVERY_MIN_BARS        = 3     # minimum recovery bars required (slow ascending close series)
 
 # ── Session-specific overrides ────────────────────────────────────────────────
+# Re-tuned 2026-04: OVERLAP/NY loosened (3/2 confirm was over-filtering),
+# RR increased across board to better align with Fibo extension (127.2–161.8%).
+# fade_thresh lowered to fire reversal more often in trending sessions.
 _SESSION_PARAMS = {
     # (confirm_candles, rr_mult_retest, rr_mult_fade, sl_atr_factor, fade_thresh)
-    "OVERLAP": (4, 3.5, 2.5, 0.6, 9),   # 12-16 UTC: most volatile — requires 4 confirmations
-    "NY":      (3, 3.0, 2.0, 0.5, 8),   # 13-21 UTC: volatile — 3 confirmations
-    "LONDON":  (2, 2.5, 1.8, 0.4, 7),   # 07-16 UTC: active but structured
-    "ASIA":    (2, 2.0, 1.5, 0.3, 6),   # 00-09 UTC: quiet — more aggressive entries OK
-    "DEFAULT": (2, 2.5, 1.7, 0.4, 7),   # transition / late US
+    "OVERLAP": (3, 3.0, 2.2, 0.5, 8),   # 12-16 UTC: volatile — 3 confirm (was 4)
+    "NY":      (2, 2.8, 2.0, 0.45, 7),  # 13-21 UTC: 2 confirm (was 3)
+    "LONDON":  (2, 2.5, 1.8, 0.4, 6),   # 07-16 UTC: loosened fade thresh 7→6
+    "ASIA":    (1, 2.0, 1.6, 0.3, 5),   # 00-09 UTC: 1 confirm suffices (ranging)
+    "DEFAULT": (2, 2.3, 1.7, 0.4, 6),   # transition / late US
 }
 
 
@@ -154,6 +157,116 @@ class ImpulseRetestEngine:
             self._check_consecutive_fade(df_m1, rr_fade, fade_thresh) or
             self._check_macd_reversal(df_m5, df_h1, rr_fade)
         )
+
+        # ── Multi-TF Candlestick pattern confirmation ────────────────
+        if signal:
+            try:
+                from core.signal.candle_patterns import detect_patterns, get_pattern_score, get_pattern_names
+                _cp_all = []
+                _cp_bonus = 0
+                for _tf_name, _tf_df, _tf_cap in [
+                    ("M1", df_m1, 2), ("M5", df_m5, 2), ("H1", df_h1, 3)
+                ]:
+                    if _tf_df is None or len(_tf_df) < 5:
+                        continue
+                    _pats = detect_patterns(_tf_df)
+                    _sc = min(get_pattern_score(_pats, signal.direction), _tf_cap)
+                    _cp_bonus += _sc
+                    _cp_all.extend(_pats)
+
+                if _cp_bonus >= 3:
+                    signal.score = min(signal.score + 3, 10)
+                    _nm = get_pattern_names(_cp_all, signal.direction)
+                    logger.info(f"🕯 REV multi-TF candle: {_nm} → score +3 = {signal.score}")
+                elif _cp_bonus >= 1:
+                    signal.score = min(signal.score + min(_cp_bonus, 2), 10)
+                    _nm = get_pattern_names(_cp_all, signal.direction)
+                    logger.info(f"🕯 REV candle: {_nm} → score +{min(_cp_bonus, 2)} = {signal.score}")
+                elif _cp_bonus <= -2:
+                    logger.info(f"🕯 REV opposing candle patterns across TFs → signal rejected")
+                    signal = None
+            except Exception:
+                pass
+
+        # ── Retrace-entry filter: wait for a small counter-move ────────
+        # SELL: last M1 candle should be bullish (price ticked up → better sell)
+        # BUY:  last M1 candle should be bearish (price ticked down → better buy)
+        # Also require retrace on lower volume (not a fresh impulse).
+        if signal and len(df_m1) >= 5:
+            _last_c = df_m1["close"].iloc[-1]
+            _last_o = df_m1["open"].iloc[-1]
+            _prev_c = df_m1["close"].iloc[-2]
+            _retrace_ok = False
+
+            if signal.direction == "sell":
+                # Want last candle bullish (close > open) = price retracing up
+                _retrace_ok = _last_c > _last_o and _last_c >= _prev_c
+            else:
+                # Want last candle bearish (close < open) = price retracing down
+                _retrace_ok = _last_c < _last_o and _last_c <= _prev_c
+
+            if not _retrace_ok:
+                logger.debug(
+                    f"REV retrace-wait: {signal.direction} signal pending — "
+                    f"waiting for counter-candle (last M1 O={_last_o:.2f} C={_last_c:.2f})"
+                )
+                return None
+
+            # Retrace must be on softer volume (< 1.5x avg) — confirms it's a pullback
+            if "tick_volume" in df_m1.columns:
+                _retrace_vol = df_m1["tick_volume"].iloc[-1]
+                _retrace_avg = df_m1["tick_volume"].tail(20).mean()
+                if _retrace_avg > 0 and _retrace_vol > _retrace_avg * 1.5:
+                    logger.debug(
+                        f"REV retrace-wait: retrace candle has high volume "
+                        f"({_retrace_vol:.0f} > 1.5x avg {_retrace_avg:.0f}) — may be new impulse, skip"
+                    )
+                    return None
+
+            logger.info(
+                f"✅ REV retrace confirmed: {signal.direction} entry on counter-candle "
+                f"(M1 O={_last_o:.2f} C={_last_c:.2f}, vol OK)"
+            )
+
+        # Volume confirmation for reversal timing
+        if signal and len(df_m5) >= 20:
+            try:
+                if "tick_volume" in df_m5.columns:
+                    _rv = df_m5["tick_volume"]
+                    _rv_avg = _rv.tail(20).mean()
+                    _rv_cur = _rv.iloc[-1]
+                    if _rv_avg > 0:
+                        _rv_ratio = _rv_cur / _rv_avg
+                        if _rv_ratio >= 2.0:
+                            signal.score = min(signal.score + 2, 10)
+                            logger.info(f"📈 REV VOL SPIKE: {_rv_cur:.0f} = {_rv_ratio:.1f}x avg → score +2")
+                        elif _rv_ratio >= 1.3:
+                            signal.score = min(signal.score + 1, 10)
+                            logger.info(f"📈 REV VOL CONFIRM: {_rv_cur:.0f} = {_rv_ratio:.1f}x avg → score +1")
+            except Exception:
+                pass
+
+        # Bollinger Band confirmation bonus on reversal signals
+        if signal and len(df_m5) >= 20:
+            try:
+                _c = df_m5["close"]
+                _sma = _c.rolling(20).mean()
+                _std = _c.rolling(20).std()
+                bb_upper = (_sma + 2 * _std).iloc[-1]
+                bb_lower = (_sma - 2 * _std).iloc[-1]
+                _price = _c.iloc[-1]
+                bb_ok = (
+                    (signal.direction == "buy"  and _price <= bb_lower) or
+                    (signal.direction == "sell" and _price >= bb_upper)
+                )
+                if bb_ok:
+                    signal.score = min(signal.score + 2, 10)
+                    logger.info(
+                        f"📊 BB reversal bonus: {signal.direction} price={_price:.2f} "
+                        f"BB=[{bb_lower:.2f}, {bb_upper:.2f}] → score +2 = {signal.score}"
+                    )
+            except Exception:
+                pass
 
         return signal
 
@@ -260,15 +373,24 @@ class ImpulseRetestEngine:
         if risk_dist < 0.5:
             return None
 
-        # TP: session-aware RR
-        tp = (current + risk_dist * rr_mult) if entry_dir == "buy" \
-             else (current - risk_dist * rr_mult)
+        # TP: Fibo 127.2% extension of the impulse range (preferred), fallback RR
+        imp_range = impulse.impulse_high - impulse.impulse_low
+        if entry_dir == "buy":
+            # Spike-down → target 127.2% extension ABOVE impulse_high
+            fibo_tp = impulse.impulse_high + imp_range * 0.272
+            fibo_rr = abs(fibo_tp - current) / risk_dist if risk_dist > 0 else 0
+            tp = fibo_tp if fibo_rr >= 1.5 else (current + risk_dist * rr_mult)
+        else:
+            fibo_tp = impulse.impulse_low - imp_range * 0.272
+            fibo_rr = abs(fibo_tp - current) / risk_dist if risk_dist > 0 else 0
+            tp = fibo_tp if fibo_rr >= 1.5 else (current - risk_dist * rr_mult)
+        rr_actual = abs(tp - current) / risk_dist if risk_dist > 0 else rr_mult
 
         logger.info(
             f"⚡ IMPULSE-RETEST: {entry_dir.upper()} @ {current:.2f} | "
             f"Spike {impulse.direction.upper()} {impulse.impulse_body/0.1:.0f}pip | "
             f"Retest zone [{impulse.retest_zone_low:.2f}-{impulse.retest_zone_high:.2f}] | "
-            f"SL={sl:.2f} TP={tp:.2f} RR=1:{rr_mult}"
+            f"SL={sl:.2f} TP={tp:.2f} RR=1:{rr_actual:.2f}"
         )
 
         return self._make_signal(
@@ -276,8 +398,8 @@ class ImpulseRetestEngine:
             entry_price=current,
             sl=sl,
             tp=tp,
-            rr=rr_mult,
-            reason=f"ImpulseRetest: {impulse.direction.upper()} spike {impulse.impulse_body/0.1:.0f}pip → retest {RETEST_FIBO_LOW*100:.0f}-{RETEST_FIBO_HIGH*100:.0f}% zone",
+            rr=rr_actual,
+            reason=f"ImpulseRetest: {impulse.direction.upper()} spike {impulse.impulse_body/0.1:.0f}pip → Fibo 127.2% ext target",
             score_bonus=3,
         )
 
@@ -356,13 +478,30 @@ class ImpulseRetestEngine:
         if risk_dist < 0.5:
             return None
 
+        # Fibo TP: 127.2% ext from most recent M5 swing (fallback RR 2.0)
         rr_mult = 2.0
         tp = current + risk_dist * rr_mult
+        try:
+            from core.structure.swing import detect_swings
+            sw = detect_swings(df_m5.tail(80)) if df_m5 is not None else []
+            hs = [s.price for s in sw if s.kind == 'high']
+            ls = [s.price for s in sw if s.kind == 'low']
+            if hs and ls and hs[-1] > ls[-1]:
+                rng = hs[-1] - ls[-1]
+                cand = hs[-1] + rng * 0.272
+                if cand <= current:
+                    cand = hs[-1] + rng * 0.618
+                cand_rr = abs(cand - current) / risk_dist if risk_dist > 0 else 0
+                if 1.5 <= cand_rr <= 4.0:
+                    tp = cand
+        except Exception:
+            pass
+        rr_actual = abs(tp - current) / risk_dist if risk_dist > 0 else rr_mult
 
         logger.info(
             f"🔄 EXHAUSTION RECOVERY: BUY @ {current:.2f} | "
             f"ATR ratio={atr_ratio:.2f} (cooled) | "
-            f"{RECOVERY_MIN_BARS} ascending bars | SL={sl:.2f} TP={tp:.2f}"
+            f"{RECOVERY_MIN_BARS} ascending bars | SL={sl:.2f} TP={tp:.2f} RR=1:{rr_actual:.2f}"
         )
 
         return self._make_signal(
@@ -370,7 +509,7 @@ class ImpulseRetestEngine:
             entry_price=current,
             sl=sl,
             tp=tp,
-            rr=rr_mult,
+            rr=rr_actual,
             reason=f"ExhaustionRecovery: ATR cooled ({atr_ratio:.1f}x) + {RECOVERY_MIN_BARS} ascending closes post-spike",
             score_bonus=2,
         )
@@ -431,14 +570,30 @@ class ImpulseRetestEngine:
         if risk_dist < 0.5:
             return None
 
-        # TP: session-aware RR (passed in)
-        tp = (current - risk_dist * rr_mult) if entry_dir == "sell" \
-             else (current + risk_dist * rr_mult)
+        # Fibo TP: 127.2% ext of the streak range (fallback session RR)
+        streak_hi = highs.iloc[-count:].max()
+        streak_lo = lows.iloc[-count:].min()
+        streak_rng = streak_hi - streak_lo
+        if entry_dir == "sell":
+            tp = current - risk_dist * rr_mult
+            if streak_rng > 0:
+                fibo_tp = streak_lo - streak_rng * 0.272
+                fibo_rr = abs(fibo_tp - current) / risk_dist if risk_dist > 0 else 0
+                if 1.2 <= fibo_rr <= 3.5:
+                    tp = fibo_tp
+        else:
+            tp = current + risk_dist * rr_mult
+            if streak_rng > 0:
+                fibo_tp = streak_hi + streak_rng * 0.272
+                fibo_rr = abs(fibo_tp - current) / risk_dist if risk_dist > 0 else 0
+                if 1.2 <= fibo_rr <= 3.5:
+                    tp = fibo_tp
+        rr_actual = abs(tp - current) / risk_dist if risk_dist > 0 else rr_mult
 
         logger.info(
             f"🔁 CONSECUTIVE FADE (No.11): {entry_dir.upper()} @ {current:.2f} | "
             f"{count} consecutive {streak_dir.upper()} candles | "
-            f"SL={sl:.2f} TP={tp:.2f} RR=1:{rr_mult}"
+            f"SL={sl:.2f} TP={tp:.2f} RR=1:{rr_actual:.2f}"
         )
 
         return self._make_signal(
@@ -446,7 +601,7 @@ class ImpulseRetestEngine:
             entry_price=current,
             sl=sl,
             tp=tp,
-            rr=rr_mult,
+            rr=rr_actual,
             reason=f"ConsecutiveFade: {count}x {streak_dir.upper()} candles exhaustion → {entry_dir.upper()} counter",
             score_bonus=1,
         )
@@ -523,10 +678,33 @@ class ImpulseRetestEngine:
         tp = (current - risk_dist * rr_mult) if entry_dir == "sell" \
              else (current + risk_dist * rr_mult)
 
+        # Fibo TP: 127.2% ext of recent M5 swing (preferred)
+        try:
+            from core.structure.swing import detect_swings
+            sw = detect_swings(df_m5.tail(80))
+            hs = [s.price for s in sw if s.kind == 'high']
+            ls = [s.price for s in sw if s.kind == 'low']
+            if hs and ls and hs[-1] > ls[-1]:
+                rng = hs[-1] - ls[-1]
+                if entry_dir == "buy":
+                    cand = hs[-1] + rng * 0.272
+                    if cand <= current:
+                        cand = hs[-1] + rng * 0.618
+                else:
+                    cand = ls[-1] - rng * 0.272
+                    if cand >= current:
+                        cand = ls[-1] - rng * 0.618
+                cand_rr = abs(cand - current) / risk_dist if risk_dist > 0 else 0
+                if 1.3 <= cand_rr <= 3.5:
+                    tp = cand
+        except Exception:
+            pass
+        rr_actual = abs(tp - current) / risk_dist if risk_dist > 0 else rr_mult
+
         logger.info(
             f"📉 MACD HIST ACCEL (No.65): {entry_dir.upper()} @ {current:.2f} | "
             f"{MACD_SHRINK_COUNT}x consecutive hist shrink ({shrink_dir}) | "
-            f"SL={sl:.2f} TP={tp:.2f} RR=1:{rr_mult}"
+            f"SL={sl:.2f} TP={tp:.2f} RR=1:{rr_actual:.2f}"
         )
 
         return self._make_signal(
@@ -534,7 +712,7 @@ class ImpulseRetestEngine:
             entry_price=current,
             sl=sl,
             tp=tp,
-            rr=rr_mult,
+            rr=rr_actual,
             reason=f"MACDHistAccel: {MACD_SHRINK_COUNT}x {shrink_dir} hist shrinking → {entry_dir.upper()} momentum exhaustion",
             score_bonus=2,
         )

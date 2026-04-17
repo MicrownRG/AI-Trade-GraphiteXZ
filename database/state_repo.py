@@ -9,7 +9,7 @@ Load rule: only apply a record if state_date == today (UTC date).
 Save rule: upsert on (account_id, state_date).
 """
 from __future__ import annotations
-from datetime import datetime, date, timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 from database.connection import get_session
@@ -21,7 +21,7 @@ logger = get_logger(__name__)
 
 def _today_utc() -> datetime:
     """Return midnight UTC for today as a datetime (used as state_date key)."""
-    d = date.today()
+    d = datetime.now(timezone.utc).date()
     return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
 
 

@@ -58,6 +58,8 @@ class OrderManager:
         self.chart_renderer = ChartRenderer()
         # Set by check_structural_contra_exit; consumed by main loop for flip entry
         self._pending_contra_flip: Optional[dict] = None
+        # Post-TP re-entry: when a trade hits TP, queue context for immediate re-entry
+        self._pending_tp_reentry: Optional[dict] = None
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -208,12 +210,13 @@ class OrderManager:
                     strategy    = strategy,
                 )
                 if img_bytes:
+                    # Plain-text caption avoids MarkdownV2 `.` / `|` / `(` 400 errors.
                     strat_label = f" | {strategy}" if strategy else ""
                     caption = (
-                        f"📈 *{order.direction.upper()}{strat_label}*\n"
-                        f"Entry: `{actual_entry:.2f}` │ SL: `{order.stop_loss:.2f}` │ TP: `{tp2:.2f}`"
+                        f"📈 {order.direction.upper()}{strat_label}\n"
+                        f"Entry: {actual_entry:.2f} | SL: {order.stop_loss:.2f} | TP: {tp2:.2f}"
                     )
-                    self.telegram.notifier.send_photo(img_bytes, caption)
+                    self.telegram.notifier.send_photo(img_bytes, caption, parse_mode="")
                     logger.info(f"Chart sent to Telegram for {trade_id}")
             except Exception as e:
                 logger.warning(f"Chart render failed (non-critical): {e}")
@@ -281,22 +284,32 @@ class OrderManager:
 
     def check_hard_cutloss(self) -> bool:
         """
-        If realized daily loss >= hard_cutloss_daily_pct:
-          1. Set portfolio.daily_cutloss_triggered = True
-          2. Close all open positions
+        Trigger cutloss on EITHER:
+          (a) realized daily loss >= limit, OR
+          (b) live equity drawdown from peak >= limit.
         Returns True if cutloss was triggered this call (first time only).
+        Respects manual reset — won't re-trigger on pre-reset losses.
         """
         if self.portfolio.daily_cutloss_triggered:
-            return False  # already triggered today
+            return False
 
         pct   = self.portfolio.realized_daily_loss_pct
-        limit = RISK_CONFIG.hard_cutloss_daily_pct
+        dd    = self.portfolio.drawdown_pct
 
+        # Equity-aware cutloss: micro-accounts ($<500) get wider threshold.
+        _base = RISK_CONFIG.hard_cutloss_daily_pct
+        _eq   = max(self.portfolio.balance, 100)
+        limit = max(_base, min(10.0, 3000.0 / _eq))
+
+        trigger_reason = None
         if pct >= limit:
+            trigger_reason = f"realized daily loss {pct:.2f}% >= {limit:.1f}%"
+        elif dd >= limit:
+            trigger_reason = f"equity drawdown {dd:.2f}% from peak >= {limit:.1f}% (floating)"
+
+        if trigger_reason:
             self.portfolio.daily_cutloss_triggered = True
-            logger.warning(
-                f"HARD CUTLOSS TRIGGERED: realized daily loss {pct:.2f}% >= {limit}%"
-            )
+            logger.warning(f"HARD CUTLOSS TRIGGERED: {trigger_reason}")
             self.close_all_positions(reason="hard_cutloss")
             return True
         return False
@@ -405,6 +418,13 @@ class OrderManager:
         )
 
         if not (bias_against or news_against):
+            # Diagnostic: log per-trade why flip skipped (rate-limited by set)
+            if htf_bias in (None, "NEUTRAL") and not trade.get("_flip_diag_neutral"):
+                trade["_flip_diag_neutral"] = True
+                logger.debug(
+                    f"Contra-flip skip {trade_id}: htf_bias={htf_bias} "
+                    f"(NEUTRAL/None — waiting for clear bias)"
+                )
             return False
 
         current_pnl = trade.get("current_pnl", 0.0)
@@ -543,6 +563,7 @@ class OrderManager:
         micro_lock_buf     = settings.get("micro_lock_buffer_pips",    1.0)
         quick_harvest_news = settings.get("quick_harvest_on_adverse_news", False)
         news_tp_mult       = settings.get("news_aligned_tp_mult",      1.0)
+        sl_plus_delay      = settings.get("sl_plus_delay_sec",         0)
 
         # Tighten trailing when news is active (volatility spike protection)
         # News-aligned sentiment keeps normal trail; adverse sentiment tightens ×0.6.
@@ -688,21 +709,71 @@ class OrderManager:
                             self.telegram.notify_trade_closed(ct)
                         continue
 
-            # ── Micro-profit-lock ratchet ─────────────────────────────────────
-            # Before the heavier BE logic, guarantee that any trade which
-            # reaches micro_profit_lock_r never returns to a losing SL.
-            # SL → entry + tiny buffer (0.5–2.0 pips depending on mode).
-            # This creates the staircase equity curve the strategy targets.
-            if micro_lock_r > 0 and not trade.get("micro_locked") and not be_active:
+            # ── Momentum-fade quick exit (100% WR guard) ────────────────────
+            # If trade reached a peak profit >= 0.5R but has now faded back to
+            # <= 0.15R, close immediately at whatever tiny profit remains.
+            # This prevents "winner turned loser". AGG+ modes only.
+            momentum_fade_exit = settings.get("momentum_fade_exit", False)
+            if momentum_fade_exit and not be_active:
                 risk = abs(entry - sl)
                 if risk > 0:
                     profit = (
                         (current_price - entry) if direction == "buy"
                         else (entry - current_price)
                     )
+                    profit_r = profit / risk
+                    # Track peak R per trade
+                    peak_r = trade.get("_peak_profit_r", 0.0)
+                    if profit_r > peak_r:
+                        trade["_peak_profit_r"] = profit_r
+                        peak_r = profit_r
+
+                    # If we hit >= 0.5R but faded to <= 0.15R → exit to preserve tiny profit
+                    if peak_r >= 0.5 and profit_r <= 0.15 and profit > 0:
+                        ticket = trade.get("mt5_ticket")
+                        if ticket:
+                            self.close_by_ticket(ticket, reason="momentum_fade")
+                        ct = ClosedTrade(
+                            trade_id    = trade_id,
+                            symbol      = trade["symbol"],
+                            direction   = direction,
+                            entry_price = entry,
+                            exit_price  = current_price,
+                            lot_size    = lot,
+                            pnl         = self._calc_pnl(direction, entry, current_price, lot),
+                            pnl_pips    = profit / 0.1 if profit else 0,
+                            opened_at   = trade["opened_at"],
+                            closed_at   = datetime.now(timezone.utc),
+                            reason      = "momentum_fade",
+                        )
+                        self.portfolio.close_trade(ct)
+                        if self.repo:
+                            self.repo.save_trade_close(ct)
+                        logger.info(
+                            f"⚡ MOMENTUM FADE EXIT: {trade_id} peak={peak_r:.2f}R "
+                            f"faded to {profit_r:.2f}R → closed at +{profit:.2f} pts"
+                        )
+                        if self.telegram:
+                            self.telegram.notify_trade_closed(ct)
+                        continue
+
+            # ── Micro-profit-lock ratchet ─────────────────────────────────────
+            # Before the heavier BE logic, guarantee that any trade which
+            # reaches micro_profit_lock_r never returns to a losing SL.
+            # SL → entry + tiny buffer (0.5–2.0 pips depending on mode).
+            # This creates the staircase equity curve the strategy targets.
+            if micro_lock_r > 0 and not trade.get("micro_locked") and not be_active:
+                _age_sec = (datetime.now(timezone.utc) - trade["opened_at"]).total_seconds()
+                if sl_plus_delay > 0 and _age_sec < sl_plus_delay:
+                    pass  # too early — skip micro-lock this cycle
+                elif (risk := abs(entry - sl)) > 0:
+                    profit = (
+                        (current_price - entry) if direction == "buy"
+                        else (entry - current_price)
+                    )
                     if profit >= risk * micro_lock_r:
-                        # pip = 0.1 for XAU/USD
-                        buf_price = micro_lock_buf * 0.1
+                        # pip = 0.1 for XAU/USD. Min 0.40 pts to cover spread.
+                        buf_price = max(0.40, micro_lock_buf * 0.1)
                         new_sl = (entry + buf_price) if direction == "buy" else (entry - buf_price)
 
                         # Only move SL if it actually improves (toward entry + buffer)
@@ -760,9 +831,9 @@ class OrderManager:
 
             # ── Breakeven activation ──────────────────────────────────────────
             if not be_active:
-                # Pulse: ultra-fast BE (0.7R or mode setting, whichever is lower)
-                # Extreme signal: moderate BE
-                # Standard: use mode be_threshold_r
+                _age_sec_be = (datetime.now(timezone.utc) - trade["opened_at"]).total_seconds()
+                _delay_ok = sl_plus_delay <= 0 or _age_sec_be >= sl_plus_delay
+
                 is_pulse   = "PULSE" in trade_id
                 is_extreme = trade.get("is_extreme", False)
 
@@ -774,15 +845,16 @@ class OrderManager:
                     be_threshold = be_r
 
                 risk = abs(entry - sl)
-                if risk > 0:
+                if risk > 0 and _delay_ok:
                     profit = (
                         (current_price - entry) if direction == "buy"
                         else (entry - current_price)
                     )
                     if profit >= risk * be_threshold:
-                        # Small buffer above/below entry to cover spread/commission
-                        buffer = 0.08  # ~8 pips
-                        new_sl = entry + buffer if direction == "buy" else entry - buffer
+                        # Buffer must cover spread + commission on XAU (~3-5 pips).
+                        # micro_lock_buf is in PIPS (×0.1 → pts). Minimum 0.50 pts.
+                        _be_buf_pts = max(0.50, micro_lock_buf * 0.1 * 1.5)
+                        new_sl = entry + _be_buf_pts if direction == "buy" else entry - _be_buf_pts
 
                         trade["stop_loss"]    = new_sl
                         trade["be_activated"] = True
@@ -895,7 +967,8 @@ class OrderManager:
 
                             # Force breakeven immediately after partial take
                             if not be_active:
-                                new_sl = entry + 0.01 if direction == "buy" else entry - 0.01
+                                _pc_buf = max(0.40, micro_lock_buf * 0.1)
+                                new_sl = entry + _pc_buf if direction == "buy" else entry - _pc_buf
                                 trade["stop_loss"]    = new_sl
                                 trade["be_activated"] = True
                                 if ticket:
@@ -985,6 +1058,112 @@ class OrderManager:
                     ct  = self._close_trade(trade_id, trade, tp, pnl, "tp2")
                     if self.telegram:
                         self.telegram.notify_trade_closed(ct)
+
+                    # Queue post-TP re-entry for the main loop
+                    self._pending_tp_reentry = {
+                        "closed_direction": direction,
+                        "tp_price":         tp,
+                        "entry_price":      entry,
+                        "symbol":           trade["symbol"],
+                        "closed_at":        datetime.now(timezone.utc),
+                        "lot_size":         lot,
+                        "sl":               trade.get("stop_loss", 0),
+                    }
+                    logger.info(
+                        f"Post-TP re-entry queued: closed {direction} @ TP {tp:.2f}, "
+                        f"watching for continuation or flip"
+                    )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Post-TP re-entry
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def consume_tp_reentry(self, current_price: float, htf_bias: str = "") -> Optional[dict]:
+        """
+        Check if a post-TP re-entry is queued and determine direction.
+        Returns dict with direction/entry/sl/tp for the main loop to execute,
+        or None if no re-entry is warranted.
+
+        Logic:
+          - If price continues past TP (momentum) → continuation entry (same dir)
+          - If price reverses from TP → flip entry (opposite dir)
+          - Must happen within 120s of TP hit
+          - HTF bias used as tiebreaker
+        """
+        pending = self._pending_tp_reentry
+        if pending is None:
+            return None
+
+        age = (datetime.now(timezone.utc) - pending["closed_at"]).total_seconds()
+        if age > 120:
+            self._pending_tp_reentry = None
+            return None
+
+        closed_dir = pending["closed_direction"]
+        tp_price   = pending["tp_price"]
+        symbol     = pending["symbol"]
+        old_risk   = abs(pending["entry_price"] - pending["sl"])
+        if old_risk < 0.5:
+            old_risk = 1.0
+
+        reentry_dir = None
+
+        if closed_dir == "sell":
+            # Closed a SELL at TP (price went down). Now:
+            # - If price drops further below TP → continuation SELL
+            # - If price bounces up above TP → flip BUY
+            if current_price < tp_price - old_risk * 0.3:
+                reentry_dir = "sell"
+            elif current_price > tp_price + old_risk * 0.3:
+                reentry_dir = "buy"
+        else:
+            # Closed a BUY at TP (price went up). Now:
+            # - If price rises further above TP → continuation BUY
+            # - If price drops below TP → flip SELL
+            if current_price > tp_price + old_risk * 0.3:
+                reentry_dir = "buy"
+            elif current_price < tp_price - old_risk * 0.3:
+                reentry_dir = "sell"
+
+        if reentry_dir is None:
+            return None
+
+        # HTF bias veto: don't enter against strong HTF trend
+        if htf_bias:
+            bias_up = htf_bias.upper()
+            if reentry_dir == "buy" and "BEAR" in bias_up:
+                logger.debug(f"Post-TP re-entry BUY vetoed by HTF bias {htf_bias}")
+                self._pending_tp_reentry = None
+                return None
+            if reentry_dir == "sell" and "BULL" in bias_up:
+                logger.debug(f"Post-TP re-entry SELL vetoed by HTF bias {htf_bias}")
+                self._pending_tp_reentry = None
+                return None
+
+        # Build re-entry params
+        atr_est = old_risk * 0.8
+        if reentry_dir == "buy":
+            sl = current_price - atr_est
+            tp = current_price + atr_est * 2.0
+        else:
+            sl = current_price + atr_est
+            tp = current_price - atr_est * 2.0
+
+        self._pending_tp_reentry = None
+
+        logger.info(
+            f"⚡ Post-TP re-entry: {reentry_dir.upper()} @ {current_price:.2f} "
+            f"(prev {closed_dir} TP={tp_price:.2f}) SL={sl:.2f} TP={tp:.2f}"
+        )
+
+        return {
+            "direction":   reentry_dir,
+            "entry_price": current_price,
+            "stop_loss":   sl,
+            "take_profit": tp,
+            "symbol":      symbol,
+            "reason":      f"PostTP_{closed_dir}→{reentry_dir}",
+        }
 
     # ─────────────────────────────────────────────────────────────────────────
     # Close helpers

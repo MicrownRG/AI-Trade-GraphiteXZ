@@ -380,8 +380,8 @@ class TelegramBot:
 
     def send_daily_summary(self) -> None:
         """Call once at end of trading day (e.g. 21:00 UTC / NY close)."""
-        from datetime import date
-        today  = date.today()
+        from datetime import datetime, timezone
+        today  = datetime.now(timezone.utc).date()
         trades = [
             t for t in self.portfolio.closed_trades
             if t.closed_at and t.closed_at.date() == today

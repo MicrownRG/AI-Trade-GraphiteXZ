@@ -44,6 +44,7 @@ class AdvancedSignalEngine(SignalEngine):
         self.scalp     = ScalpLogic()
         self.multi_tf  = MultiTFAnalyzer()
         self._logged_bypasses = set()
+        self._logged_thin_retrace = set()
 
     def generate(
         self, 
@@ -175,6 +176,27 @@ class AdvancedSignalEngine(SignalEngine):
             logger.info(f"Signal: no bias detected (multi_tf={TRADING_CONFIG.enable_multi_tf})")
             return None
 
+        # ── HTF TREND-LOCK GUARD ─────────────────────────────────────────────
+        # Block counter-trend entries when H4 AND H1 are both strongly aligned
+        # AND ADX shows a real trend (not chop). Prevents "selling into a bull
+        # impulse" → cutloss. Counter-trend only allowed via reversal_engine.
+        try:
+            if TRADING_CONFIG.enable_multi_tf and mtf is not None:
+                _h4 = mtf.tfs.get("h4")
+                _h1 = mtf.tfs.get("h1")
+                if _h4 and _h1 and _h4.bias == _h1.bias and _h4.bias != "NEUTRAL":
+                    htf_dir = "buy" if _h4.bias == "BULLISH" else "sell"
+                    htf_adx = max(getattr(_h4, "adx", 0) or 0, getattr(_h1, "adx", 0) or 0)
+                    if direction != htf_dir and htf_adx >= 22:
+                        logger.info(
+                            f"🚧 HTF TREND-LOCK: blocked {direction.upper()} — "
+                            f"H4+H1 both {_h4.bias} (ADX {htf_adx:.1f}). "
+                            f"Counter-trend only via reversal_engine."
+                        )
+                        return None
+        except Exception:
+            pass
+
         # Stable key to deduplicate repeated log messages for the same setup
         signal_key = f"{symbol}_{direction}"
         
@@ -292,15 +314,91 @@ class AdvancedSignalEngine(SignalEngine):
         except Exception:
             pass
 
-        # ── 6. Tick Volume Burst Bonus (No.5) ─────────────────────────────
-        # If tick volume on the last M1 candle is >300% of the avg, bonus +1
+        # ── 6. Volume Confirmation ────────────────────────────────────────
+        # M1 volume burst: strong momentum confirmation
+        # M5 rising volume: institutional participation
         try:
-            if "tick_volume" in df_m1.columns and len(df_m1) >= 10:
-                vol_avg = df_m1["tick_volume"].tail(10).mean()
+            if "tick_volume" in df_m1.columns and len(df_m1) >= 20:
+                vol_avg = df_m1["tick_volume"].tail(20).mean()
                 vol_cur = df_m1["tick_volume"].iloc[-1]
-                if vol_avg > 0 and vol_cur > vol_avg * 3.0:
-                    logger.info(f"📈 VOLUME BURST (No.5): Tick vol {vol_cur:.0f} = {vol_cur/vol_avg:.1f}x avg → +1 score")
+                if vol_avg > 0:
+                    vol_ratio = vol_cur / vol_avg
+                    if vol_ratio >= 3.0:
+                        score += 2
+                        logger.info(f"📈 VOLUME BURST: M1 tick vol {vol_cur:.0f} = {vol_ratio:.1f}x avg → +2")
+                    elif vol_ratio >= 1.5:
+                        score += 1
+                        logger.info(f"📈 VOLUME CONFIRM: M1 tick vol {vol_cur:.0f} = {vol_ratio:.1f}x avg → +1")
+            if "tick_volume" in df_m5.columns and len(df_m5) >= 20:
+                _v5 = df_m5["tick_volume"]
+                _v5_avg = _v5.tail(20).mean()
+                _v5_last3 = _v5.tail(3).mean()
+                if _v5_avg > 0 and _v5_last3 >= _v5_avg * 1.3:
                     score += 1
+                    logger.info(f"📈 M5 VOL RISING: last 3 bars avg {_v5_last3:.0f} vs 20-bar {_v5_avg:.0f} → +1")
+        except Exception:
+            pass
+
+        # ── 7. Bollinger Band Confluence ─────────────────────────────────
+        # Price near/outside BB band in trade direction = mean-reversion or
+        # breakout confirmation. M5 BB(20,2) used for entry-level precision.
+        try:
+            if len(df_m5) >= 20:
+                _bb_close = df_m5["close"]
+                _bb_sma = _bb_close.rolling(20).mean()
+                _bb_std = _bb_close.rolling(20).std()
+                bb_upper = (_bb_sma + 2 * _bb_std).iloc[-1]
+                bb_lower = (_bb_sma - 2 * _bb_std).iloc[-1]
+                bb_mid   = _bb_sma.iloc[-1]
+                _bb_price = _bb_close.iloc[-1]
+
+                if direction == "buy" and _bb_price <= bb_lower:
+                    score += 2
+                    logger.info(f"📊 BB: price {_bb_price:.2f} at/below lower band {bb_lower:.2f} → +2")
+                elif direction == "sell" and _bb_price >= bb_upper:
+                    score += 2
+                    logger.info(f"📊 BB: price {_bb_price:.2f} at/above upper band {bb_upper:.2f} → +2")
+                elif direction == "buy" and _bb_price < bb_mid:
+                    score += 1
+                    logger.debug(f"BB: price below mid-band → +1")
+                elif direction == "sell" and _bb_price > bb_mid:
+                    score += 1
+                    logger.debug(f"BB: price above mid-band → +1")
+        except Exception:
+            pass
+
+        # ── 8. Multi-TF Candlestick Pattern Recognition ────────────────
+        # Scan M1, M5, M15, H1 for reversal/continuation patterns.
+        # Higher TF patterns carry more weight (H1 engulfing > M1 engulfing).
+        try:
+            from core.signal.candle_patterns import detect_patterns, get_pattern_score, get_pattern_names
+            _cp_all = []
+            _cp_bonus = 0
+            _cp_labels = []
+            for _tf_name, _tf_df, _tf_cap in [
+                ("M1",  df_m1,  2),
+                ("M5",  df_m5,  2),
+                ("M15", df_m15, 3),
+                ("H1",  df_h1,  3),
+            ]:
+                if _tf_df is None or len(_tf_df) < 5:
+                    continue
+                _pats = detect_patterns(_tf_df)
+                _sc = get_pattern_score(_pats, direction)
+                _capped = min(max(_sc, -1), _tf_cap)
+                _cp_bonus += _capped
+                if _sc > 0:
+                    _names = get_pattern_names(_pats, direction)
+                    _cp_labels.append(f"{_tf_name}:{_names}")
+                _cp_all.extend(_pats)
+
+            _cp_final = min(_cp_bonus, 5)
+            if _cp_final > 0:
+                score += _cp_final
+                logger.info(f"🕯 Candle patterns: {'; '.join(_cp_labels)} → +{_cp_final} score")
+            elif _cp_final <= -2:
+                score -= 1
+                logger.info(f"🕯 Opposing candle patterns across TFs → -1 score")
         except Exception:
             pass
 
@@ -444,6 +542,89 @@ class AdvancedSignalEngine(SignalEngine):
                 # To minimize floating, we only enter if price is between the structure's high and low.
                 if target_zone_low - buffer_pips <= current_price <= target_zone_high + buffer_pips:
                     in_zone = True
+
+            # --- THIN RETRACE ENTRY (valid-but-small) ---
+            # When price overshot the zone but is now retracing BACK toward it,
+            # we accept a half-size entry instead of waiting for a full tag.
+            # Validity requires:
+            #   1. Score >= threshold (same bar as a normal entry)
+            #   2. Price within ATR_M1 * 1.5 of the zone boundary (close, not miles away)
+            #   3. Last 2 M1 candles moving TOWARD the zone (real retrace, not still running away)
+            #   4. Structural SL still anchored to the OB/FVG boundary
+            thin_retrace  = False
+            thin_mult     = 0.5  # half-size — valid but tipis
+            if not in_zone and score >= threshold and len(df_m1) >= 3:
+                _atr_prox = max(atr_m1, 0.5)
+
+                # Fallback zone: if no OB/FVG matched, synthesize one from the
+                # nearest M1 swing extreme so thin-retrace still applies.
+                z_low, z_high = target_zone_low, target_zone_high
+                zone_source = "OB/FVG"
+                if z_low is None or z_high is None:
+                    try:
+                        win = df_m1.tail(30)
+                        if direction == "buy":
+                            z_ref = win["low"].min()
+                            z_low, z_high = z_ref - _atr_prox * 0.3, z_ref + _atr_prox * 0.3
+                        else:
+                            z_ref = win["high"].max()
+                            z_low, z_high = z_ref - _atr_prox * 0.3, z_ref + _atr_prox * 0.3
+                        zone_source = "M1_SWING"
+                    except Exception:
+                        z_low = z_high = None
+
+                if z_low is None or z_high is None:
+                    logger.info("📉 thin-retrace skip: no zone derivable")
+                else:
+                    if direction == "buy":
+                        dist_to_zone = current_price - z_high
+                    else:
+                        dist_to_zone = z_low - current_price
+
+                    # Retrace: last 1 bar closing back toward zone (relaxed from 2).
+                    c1 = df_m1["close"].iloc[-1]
+                    c2 = df_m1["close"].iloc[-2]
+                    retracing = (c1 < c2) if direction == "buy" else (c1 > c2)
+
+                    # Volume floor (relaxed 0.6× avg) — block only truly dead bars.
+                    vol_ok = True
+                    try:
+                        if "tick_volume" in df_m1.columns and len(df_m1) >= 20:
+                            _vavg = df_m1["tick_volume"].tail(20).mean()
+                            _vcur = df_m1["tick_volume"].iloc[-1]
+                            if _vavg > 0 and _vcur < _vavg * 0.6:
+                                vol_ok = False
+                    except Exception:
+                        pass
+
+                    # Widen proximity to ATR × 2.0 (was 1.5).
+                    in_range = 0 < dist_to_zone <= _atr_prox * 2.0
+                    if in_range and retracing and vol_ok:
+                        thin_retrace = True
+                        in_zone = True
+                        # Anchor SL to synthesized zone if we had none before
+                        if extreme_sl is None:
+                            extreme_sl = (z_low - buffer_pips) if direction == "buy" else (z_high + buffer_pips)
+                            target_zone_low, target_zone_high = z_low, z_high
+                        if signal_key not in self._logged_thin_retrace:
+                            logger.info(
+                                f"📉 THIN RETRACE ENTRY [{zone_source}]: dist {dist_to_zone:.2f} "
+                                f"(max {_atr_prox*2.0:.2f}), retrace={retracing}, vol_ok={vol_ok} "
+                                f"— half-size (x{thin_mult}). score={score}/{threshold}"
+                            )
+                            self._logged_thin_retrace.add(signal_key)
+                    else:
+                        # One-shot diagnostic per setup — explain why skipped
+                        if signal_key not in self._logged_thin_retrace:
+                            logger.info(
+                                f"📉 thin-retrace skip [{zone_source}]: dist={dist_to_zone:.2f} "
+                                f"(max {_atr_prox*2.0:.2f}) in_range={in_range} "
+                                f"retrace={retracing} vol_ok={vol_ok}"
+                            )
+                            self._logged_thin_retrace.add(signal_key)
+
+            if len(self._logged_thin_retrace) > 100:
+                self._logged_thin_retrace.clear()
 
             # --- MOMENTUM BREAKOUT BYPASS ---
             # When fast momentum carries price beyond the structural zone before
@@ -604,6 +785,39 @@ class AdvancedSignalEngine(SignalEngine):
                 take_profit = current_price + (risk_dist * 1.5) if direction == "buy" else current_price - (risk_dist * 1.5)
                 final_rr = 1.5
 
+            # ── THIN RETRACE TP OVERRIDE ─────────────────────────────────────
+            # When we entered "thin" (price not yet at zone, only retracing toward
+            # it), TP must be CLOSER not farther. Otherwise SL hits before the
+            # far Fibo extension. Use the nearest Fibo level (50%-100% of the
+            # impulse, capped at RR 1.5) so the trade has high hit probability.
+            entry_tier_label = "ZONE"
+            lot_mult = 1.0
+            if thin_retrace:
+                entry_tier_label = "THIN_RETRACE"
+                lot_mult = thin_mult  # 0.5 by default
+                # Tight TP: cap at RR 1.5 (closer than session/Fibo extension)
+                tight_rr = 1.5
+                if direction == "buy":
+                    tight_tp = current_price + (risk_dist * tight_rr)
+                    if tight_tp < take_profit:
+                        take_profit = tight_tp
+                        final_rr = tight_rr
+                        logger.info(
+                            f"📉 THIN RETRACE TP CAP: TP pulled in to {tight_tp:.2f} "
+                            f"(RR {tight_rr}) — high hit probability for half-size entry"
+                        )
+                else:
+                    tight_tp = current_price - (risk_dist * tight_rr)
+                    if tight_tp > take_profit:
+                        take_profit = tight_tp
+                        final_rr = tight_rr
+                        logger.info(
+                            f"📉 THIN RETRACE TP CAP: TP pulled in to {tight_tp:.2f} "
+                            f"(RR {tight_rr}) — high hit probability for half-size entry"
+                        )
+            elif momentum_bypass:
+                entry_tier_label = "MOMENTUM"
+
             return TradeSignal(
                 signal_id      = f"SMC_{int(time.time())}",
                 symbol         = kwargs.get("symbol", SYMBOL), # Use global SYMBOL if not provided
@@ -620,6 +834,8 @@ class AdvancedSignalEngine(SignalEngine):
                 is_extreme     = is_extreme,
                 is_stalking    = is_stalking,
                 stalking_reason = stalking_reason,
+                lot_multiplier = lot_mult,
+                entry_tier     = entry_tier_label,
             )
             
         return None

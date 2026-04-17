@@ -68,7 +68,8 @@ TF_TTL = {
 class TFTrend:
     """Trend result for a single timeframe."""
     __slots__ = ("tf", "bias", "adx", "ema_cross", "weight", "score",
-                 "at_zone", "rejection", "fibo_golden", "fibo_retrace_pct")
+                 "at_zone", "rejection", "fibo_golden", "fibo_retrace_pct",
+                 "candle_pattern", "vol_ratio")
 
     def __init__(
         self,
@@ -80,6 +81,8 @@ class TFTrend:
         rejection: str = "NONE",
         fibo_golden: str = "NONE",      # "BULLISH" | "BEARISH" | "NONE"
         fibo_retrace_pct: float = 0.0,  # current retrace %
+        candle_pattern: str = "",        # detected pattern name(s) aligned with bias
+        vol_ratio: float = 1.0,         # current vol / avg vol
     ):
         self.tf        = tf
         self.bias      = bias       # "BULLISH" | "BEARISH" | "NEUTRAL"
@@ -89,6 +92,8 @@ class TFTrend:
         self.rejection = rejection  # "BULLISH" | "BEARISH" | "NONE"
         self.fibo_golden = fibo_golden
         self.fibo_retrace_pct = fibo_retrace_pct
+        self.candle_pattern = candle_pattern
+        self.vol_ratio = vol_ratio
         self.weight    = TF_WEIGHTS.get(tf.lower(), 1)
 
         # Base score: weight * strength multiplier
@@ -107,6 +112,14 @@ class TFTrend:
         # Fibo golden pocket bonus (price at 61.8–78.6% retracement aligned to bias)
         if fibo_golden != "NONE" and fibo_golden == bias:
             self.score += self.weight * 0.6
+
+        # Candle pattern bonus — HTF patterns (H4/H1) carry more conviction
+        if candle_pattern:
+            self.score += self.weight * 0.4
+
+        # Volume confirmation bonus — high volume validates the TF signal
+        if vol_ratio >= 1.5:
+            self.score += self.weight * 0.3
 
     def __repr__(self) -> str:
         return f"{self.tf.upper()}:{self.bias}(adx={self.adx:.0f})"
@@ -259,6 +272,10 @@ class MultiTFAnalysis:
                 item += "*"   # OB/FVG zone hit
             if v.fibo_golden != "NONE":
                 item += "φ"   # Fibo golden pocket (61.8-78.6%)
+            if v.candle_pattern:
+                item += "🕯"  # candle pattern detected
+            if v.vol_ratio >= 1.5:
+                item += "V"   # high volume
             parts.append(item)
 
         return (
@@ -266,6 +283,56 @@ class MultiTFAnalysis:
             f" -> {self.direction or 'NEUTRAL'} "
             f"[conf={self.confidence:.0%} bull={self.bull_score:.1f} bear={self.bear_score:.1f}]"
         )
+
+
+    def find_multi_tf_sr(self, tf_dataframes: Dict[str, pd.DataFrame], price: float, tolerance_pts: float = 3.0) -> list:
+        """
+        Find S/R levels confirmed by multiple timeframes.
+        Returns list of dicts: {price, kind, tf_count, tfs, distance}.
+        Levels within tolerance_pts of each other are merged.
+        """
+        from core.structure.swing import detect_swings
+        all_levels = []
+        for tf_name, df in tf_dataframes.items():
+            if df is None or len(df) < 30:
+                continue
+            try:
+                swings = detect_swings(df.tail(120))
+                for s in swings[-10:]:
+                    all_levels.append({"price": s.price, "kind": s.kind, "tf": tf_name})
+            except Exception:
+                continue
+
+        if not all_levels:
+            return []
+
+        all_levels.sort(key=lambda x: x["price"])
+        clusters = []
+        used = set()
+        for i, lv in enumerate(all_levels):
+            if i in used:
+                continue
+            cluster = [lv]
+            used.add(i)
+            for j in range(i + 1, len(all_levels)):
+                if j in used:
+                    continue
+                if abs(all_levels[j]["price"] - lv["price"]) <= tolerance_pts:
+                    cluster.append(all_levels[j])
+                    used.add(j)
+            if len(set(c["tf"] for c in cluster)) >= 2:
+                avg_price = sum(c["price"] for c in cluster) / len(cluster)
+                kind = "resistance" if sum(1 for c in cluster if c["kind"] == "high") > len(cluster) / 2 else "support"
+                tfs = sorted(set(c["tf"] for c in cluster))
+                clusters.append({
+                    "price": round(avg_price, 2),
+                    "kind": kind,
+                    "tf_count": len(tfs),
+                    "tfs": tfs,
+                    "distance": round(abs(price - avg_price), 2),
+                })
+        clusters.sort(key=lambda x: x["distance"])
+        return clusters[:5]
 
 
 class MultiTFAnalyzer:
@@ -329,6 +396,28 @@ class MultiTFAnalyzer:
             except Exception:
                 pass
 
+            # Candle pattern detection per TF
+            _cp_name = ""
+            try:
+                from core.signal.candle_patterns import detect_patterns, get_pattern_names
+                _bias_dir = "buy" if bias_current == "BULLISH" else ("sell" if bias_current == "BEARISH" else "")
+                if _bias_dir:
+                    _pats = detect_patterns(df)
+                    _cp_name = get_pattern_names(_pats, _bias_dir)
+            except Exception:
+                pass
+
+            # Volume ratio (current bar vs 20-bar avg)
+            _vol_ratio = 1.0
+            try:
+                _vol_col = "tick_volume" if "tick_volume" in df.columns else ("volume" if "volume" in df.columns else None)
+                if _vol_col and len(df) >= 20:
+                    _v_avg = df[_vol_col].tail(20).mean()
+                    _v_cur = df[_vol_col].iloc[-2]  # last closed bar
+                    _vol_ratio = _v_cur / _v_avg if _v_avg > 0 else 1.0
+            except Exception:
+                pass
+
             return TFTrend(
                 tf        = tf_name,
                 bias      = bias_current,
@@ -338,6 +427,8 @@ class MultiTFAnalyzer:
                 rejection = result.get("rejection", "NONE"),
                 fibo_golden = fibo_golden,
                 fibo_retrace_pct = fibo_retrace_pct,
+                candle_pattern = _cp_name,
+                vol_ratio = _vol_ratio,
             )
         except Exception as e:
             logger.debug(f"MultiTF: failed to analyze {tf_name}: {e}")

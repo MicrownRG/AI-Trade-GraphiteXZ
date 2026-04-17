@@ -65,6 +65,11 @@ class TradeSignal:
     is_stalking: bool = False
     stalking_reason: str = ""
 
+    # ── Size Modulation (thin-retrace, tiered entries) ───────────────────────
+    # 1.0 = full size, <1.0 = scaled-down entry (still valid setup, reduced risk)
+    lot_multiplier: float = 1.0
+    entry_tier: str = "ZONE"  # ZONE | PROXIMITY | THIN_RETRACE | MOMENTUM
+
     @property
     def is_valid(self) -> bool:
         return (

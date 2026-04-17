@@ -227,6 +227,7 @@ class CommandHandler:
             "/adapter":   self._cmd_adapter,
             "/backtest":  self._cmd_backtest,
             "/config":    self._cmd_config,
+            "/planning":  self._cmd_planning,
         }
 
         fn = handlers.get(cmd)
@@ -480,14 +481,25 @@ class CommandHandler:
                 pf = self.bot_ref.portfolio
                 pf.pulse_suspended_today    = False
                 pf.pulse_consecutive_losses = 0
-                pf.daily_cutloss_triggered  = False   # ← include hard cutloss in full reset
+                pf.reset_cutloss()  # clears flag + offsets PnL + resets peak/day_start
                 if hasattr(self.bot_ref, "telegram") and hasattr(self.bot_ref.telegram, "_stalking_cooldowns"):
                     self.bot_ref.telegram._stalking_cooldowns.clear()
                 # Persist reset state to DB so it survives a bot restart
                 if hasattr(self.bot_ref, "state_repo") and self.bot_ref.state_repo:
                     self.bot_ref.state_repo.save_from_portfolio(pf, revenge_cleared_at=_now)
                 self._answer_callback(cq_id, "✅ ALL cooldowns reset")
-                self._edit_message(chat_id, cq.get("message", {}).get("message_id"), "✅ *All Cooldowns Cleared*\\.\nHard cutloss flag cleared\\. Bot is fully armed\\.")
+                # Show verified state after reset
+                _rl = pf.realized_daily_loss_pct
+                _dd = pf.drawdown_pct
+                self._edit_message(chat_id, cq.get("message", {}).get("message_id"),
+                    f"✅ *All Cooldowns Cleared*\\.\n"
+                    f"Hard cutloss: `FALSE`\n"
+                    f"Realized loss \\(post\\-reset\\): `{_rl:.1f}%`\n"
+                    f"Drawdown \\(post\\-reset\\): `{_dd:.1f}%`\n"
+                    f"Day start balance: `${pf._day_start_balance_val:.2f}`\n"
+                    f"PnL offset: `{pf._cutloss_pnl_offset:.2f}`\n"
+                    f"Bot is fully armed\\."
+                )
                 
             elif action == "revenge":
                 import core.risk.filters as filters
@@ -517,13 +529,18 @@ class CommandHandler:
 
             elif action == "cutloss":
                 pf = self.bot_ref.portfolio
-                pf.daily_cutloss_triggered = False
+                pf.reset_cutloss()  # clears flag + offsets PnL + resets peak/day_start
                 if hasattr(self.bot_ref, "state_repo") and self.bot_ref.state_repo:
                     self.bot_ref.state_repo.save_from_portfolio(pf)
-                self._answer_callback(cq_id, "✅ Hard Cutloss flag cleared")
+                self._answer_callback(cq_id, "✅ Hard Cutloss fully reset")
+                _rl = pf.realized_daily_loss_pct
+                _dd = pf.drawdown_pct
                 self._edit_message(
                     chat_id, cq.get("message", {}).get("message_id"),
-                    "🔴 *Hard Cutloss Flag Cleared*\\.\nBot can enter new trades\\. Use responsibly\\."
+                    f"🔴 *Hard Cutloss Cleared*\\.\n"
+                    f"Realized loss \\(post\\-reset\\): `{_rl:.1f}%`\n"
+                    f"Drawdown \\(post\\-reset\\): `{_dd:.1f}%`\n"
+                    f"Bot can enter new trades\\."
                 )
 
         elif data == "ignore":
@@ -996,6 +1013,157 @@ class CommandHandler:
             )
         self._reply(chat_id, msg)
 
+    def _cmd_planning(self, chat_id: str, args: list) -> None:
+        """
+        Show dual-direction planning (BUY + SELL) from recent signals,
+        with Fibo levels, multi-TF S/R, candle patterns, and win-rate estimate.
+        """
+        try:
+            from database.connection import get_session
+            from database.models import SignalModel
+            from config.trading_config import TRADING_CONFIG
+
+            # Fetch last N signals (may include both BUY and SELL)
+            with get_session() as s:
+                rows = (
+                    s.query(SignalModel)
+                    .order_by(SignalModel.timestamp.desc())
+                    .limit(10)
+                    .all()
+                )
+                if not rows:
+                    self._reply(chat_id, "📋 Planning: no recent signals in DB\\.")
+                    return
+                signals = []
+                for row in rows:
+                    signals.append({
+                        "id":      row.signal_id,
+                        "ts":      row.timestamp,
+                        "dir":     row.direction,
+                        "entry":   float(row.entry_price),
+                        "sl":      float(row.stop_loss),
+                        "tp":      float(row.take_profit),
+                        "rr":      float(row.rr_ratio or 0),
+                        "score":   int(row.score or 0),
+                        "max":     int(row.max_score or 10),
+                        "session": row.session or "?",
+                        "htf_dir": row.htf_direction or "neutral",
+                    })
+
+            # Pick best BUY and best SELL signal (highest score)
+            buy_sigs = [s for s in signals if s["dir"] == "buy"]
+            sell_sigs = [s for s in signals if s["dir"] == "sell"]
+            plans = []
+            if buy_sigs:
+                plans.append(max(buy_sigs, key=lambda x: x["score"]))
+            if sell_sigs:
+                plans.append(max(sell_sigs, key=lambda x: x["score"]))
+            if not plans:
+                plans = [signals[0]]
+
+            mode_settings = TRADING_CONFIG.mode_settings.get(TRADING_CONFIG.current_mode, {})
+            threshold = mode_settings.get("min_score_threshold", 5)
+
+            # Multi-TF S/R levels (if bot_ref available)
+            sr_lines = []
+            candle_info = ""
+            try:
+                if hasattr(self.bot_ref, "multi_tf_analyzer"):
+                    mtf = self.bot_ref.multi_tf_analyzer
+                    if mtf and mtf.last_result:
+                        tick = None
+                        if hasattr(self.bot_ref, "mt5"):
+                            tick = self.bot_ref.mt5.get_symbol_tick("XAUUSD")
+                        cur_price = tick["bid"] if tick else plans[0]["entry"]
+                        tf_dfs = {}
+                        for attr, name in [("df_h4", "h4"), ("df_h1", "h1"), ("df_m15", "m15"), ("df_m5", "m5")]:
+                            if hasattr(self.bot_ref, attr):
+                                tf_dfs[name] = getattr(self.bot_ref, attr)
+                        if tf_dfs:
+                            sr = mtf.last_result.find_multi_tf_sr(tf_dfs, cur_price)
+                            for lv in sr[:3]:
+                                _tfs = ",".join(lv["tfs"])
+                                sr_lines.append(
+                                    f"  {'🔴' if lv['kind']=='resistance' else '🟢'} "
+                                    f"`{lv['price']:.2f}` {lv['kind']} "
+                                    f"_\\({_tfs}, dist {lv['distance']:.1f}\\)_"
+                                )
+
+                        # Candle patterns from cached MTF
+                        _cp_parts = []
+                        for tf_name, tf_trend in mtf.last_result.tfs.items():
+                            if tf_trend.candle_pattern:
+                                _cp_parts.append(f"{tf_name.upper()}: {tf_trend.candle_pattern}")
+                        if _cp_parts:
+                            candle_info = " │ ".join(_cp_parts)
+            except Exception:
+                pass
+
+            # Build message for each plan
+            all_messages = []
+            for i, sig in enumerate(plans):
+                risk_dist   = abs(sig["entry"] - sig["sl"])
+                reward_dist = abs(sig["tp"] - sig["entry"])
+                rr = sig["rr"] or (reward_dist / risk_dist if risk_dist > 0 else 0)
+
+                if sig["dir"] == "buy":
+                    fibo_127 = sig["entry"] + risk_dist * 1.272
+                    fibo_161 = sig["entry"] + risk_dist * 1.618
+                    fibo_200 = sig["entry"] + risk_dist * 2.0
+                else:
+                    fibo_127 = sig["entry"] - risk_dist * 1.272
+                    fibo_161 = sig["entry"] - risk_dist * 1.618
+                    fibo_200 = sig["entry"] - risk_dist * 2.0
+
+                if   rr <= 1.0:  base_wr = 65
+                elif rr <= 1.5:  base_wr = 60
+                elif rr <= 2.0:  base_wr = 50
+                elif rr <= 2.5:  base_wr = 45
+                else:            base_wr = 40
+
+                score_bonus = max(0, sig["score"] - threshold) * 2
+                htf_bonus = 5 if sig["htf_dir"].lower() == sig["dir"] else 0
+                wr_est = max(30, min(90, base_wr + score_bonus + htf_bonus))
+                tier = "🟢 HIGH" if wr_est >= 80 else ("🟡 OK" if wr_est >= 60 else "🔴 LOW")
+                ts_str = sig["ts"].strftime("%H:%M:%S") if sig["ts"] else "?"
+                arrow = "▲" if sig["dir"] == "buy" else "▼"
+
+                lines = [
+                    f"📋 *PLAN {i+1}: {arrow} {sig['dir'].upper()}*",
+                    f"`{self._esc_v2(sig['id'])}` _\\@_ `{ts_str}` │ `{sig['session']}`",
+                    f"_HTF:_ `{sig['htf_dir']}`",
+                    "",
+                    f"🎯 Entry  `{sig['entry']:.2f}`",
+                    f"🛑 SL     `{sig['sl']:.2f}` _\\({risk_dist:.1f} pts\\)_",
+                    f"🏁 TP     `{sig['tp']:.2f}` _\\({reward_dist:.1f} pts, RR {rr:.1f}\\)_",
+                    "",
+                    f"📐 _Fibo:_ `127%={fibo_127:.2f}` `161%={fibo_161:.2f}` `200%={fibo_200:.2f}`",
+                    f"📊 Score `{sig['score']}/{sig['max']}` │ WR *{wr_est}%* {tier}",
+                ]
+                all_messages.extend(lines)
+                if i < len(plans) - 1:
+                    all_messages.append(f"\n{'─' * 20}\n")
+
+            # Append shared context
+            if candle_info:
+                all_messages.append(f"\n🕯 *Candle Patterns:*")
+                all_messages.append(f"  `{self._esc_v2(candle_info)}`")
+            if sr_lines:
+                all_messages.append(f"\n🧱 *Multi\\-TF S/R:*")
+                all_messages.extend(sr_lines)
+
+            self._reply(chat_id, "\n".join(all_messages))
+        except Exception as e:
+            logger.error(f"_cmd_planning error: {e}")
+            self._reply(chat_id, f"⚠️ Planning error: {str(e)[:100]}", parse_mode="")
+
+    @staticmethod
+    def _esc_v2(s) -> str:
+        s = str(s)
+        for ch in ("_", ".", "-", "(", ")", "+", "=", "|", "!", "{", "}", "#", ">"):
+            s = s.replace(ch, f"\\{ch}")
+        return s
+
     def _cmd_config(self, chat_id: str, args: list) -> None:
         """
         View or update a single config value in the DB for the current account.
@@ -1025,18 +1193,76 @@ class CommandHandler:
         # ── Show current config ───────────────────────────────────────────────
         if not args:
             try:
+                from config.risk_config import RISK_CONFIG
+
+                tc = TRADING_CONFIG
+                mode = tc.current_mode
+                ms   = tc.mode_settings.get(mode, {}) or {}
+
+                def _esc(s): return str(s).replace("_", "\\_").replace(".", "\\.").replace("-", "\\-").replace("(", "\\(").replace(")", "\\)")
+
                 with get_session() as session:
                     row = session.query(AccountConfigModel).filter_by(account_id=account_id).first()
 
-                lines = [f"⚙️ *Config — Account \\#{account_id}*\n{'─'*22}"]
+                lines = [f"⚙️ *LIVE CONFIG — Account \\#{account_id}*"]
+
+                # ── Active trade mode & core risk ─────────────────────────
+                lines.append(f"\n*🎯 Mode:* `{_esc(mode.value)}`")
+                lines.append(f"  • risk\\_per\\_trade: `{ms.get('risk_per_trade', 0)*100:.2f}%`")
+                lines.append(f"  • min\\_score: `{ms.get('min_score_threshold', '?')}`")
+                lines.append(f"  • partial\\_close: `{ms.get('partial_close', '?')}` \\({ms.get('partial_close_fraction', 0.5)*100:.0f}%\\)")
+                lines.append(f"  • be\\_threshold\\_r: `{ms.get('be_threshold_r', '?')}`")
+                lines.append(f"  • trailing\\_pips: `{ms.get('trailing_pips', '?')}`")
+                lines.append(f"  • pulse\\_scalping: `{ms.get('pulse_scalping', False)}`")
+
+                # ── Profit-lock ──
+                lines.append(f"\n*🔒 Profit Lock \\(staircase\\):*")
+                lines.append(f"  • micro\\_profit\\_lock\\_r: `{ms.get('micro_profit_lock_r', '?')}`")
+                lines.append(f"  • micro\\_lock\\_buffer\\_pips: `{ms.get('micro_lock_buffer_pips', '?')}`")
+                lines.append(f"  • news\\_aligned\\_tp\\_mult: `{ms.get('news_aligned_tp_mult', '?')}`")
+                lines.append(f"  • quick\\_harvest\\_on\\_adverse\\_news: `{ms.get('quick_harvest_on_adverse_news', '?')}`")
+
+                # ── Risk global ──
+                lines.append(f"\n*🛡 Risk Global:*")
+                lines.append(f"  • min\\_signal\\_score: `{RISK_CONFIG.min_signal_score}`")
+                lines.append(f"  • min\\_rr\\_ratio: `{RISK_CONFIG.min_rr_ratio}`")
+                lines.append(f"  • max\\_concurrent\\_trades: `{RISK_CONFIG.max_concurrent_trades}`")
+                lines.append(f"  • max\\_daily\\_trades: `{RISK_CONFIG.max_daily_trades}`")
+                lines.append(f"  • revenge\\_cooldown\\_min: `{RISK_CONFIG.revenge_cooldown_min}`")
+                lines.append(f"  • min\\_lot\\_size: `{RISK_CONFIG.min_lot_size}`")
+
+                # ── Features ──
+                lines.append(f"\n*⚡ Features:*")
+                lines.append(f"  • asian\\_session: `{tc.enable_asian_session}`")
+                lines.append(f"  • partial\\_close: `{tc.enable_partial_close}`")
+                lines.append(f"  • multi\\_tf: `{tc.enable_multi_tf}`")
+                lines.append(f"  • ai\\_adapter: `{tc.ai_adapter_enabled}`")
+                lines.append(f"  • atr\\_range: `{tc.min_atr_pips}–{tc.max_atr_pips} pips`")
+
+                # ── Score weights ──
+                lines.append(f"\n*📊 Score Weights:*")
+                for k, v in tc.score_weights.items():
+                    lines.append(f"  • {_esc(k)}: `{v}`")
+
+                # ── DB-overridable fields ──
+                lines.append(f"\n*💾 DB\\-overridable:*")
                 for _, db_field, _, _ in _FIELD_MAP:
                     db_val = getattr(row, db_field, None) if row else None
                     val_str = str(db_val) if db_val is not None else "_default_"
-                    lines.append(f"`{db_field}` \\= `{val_str}`")
-                lines.append(f"\n_Use `/config <field> <value>` to update_")
-                self._reply(chat_id, "\n".join(lines))
+                    lines.append(f"  • `{db_field}` \\= `{_esc(val_str)}`")
+
+                lines.append(f"\n_Update: `/config <field> <value>`_")
+
+                # Telegram message limit 4096 — split if needed
+                full = "\n".join(lines)
+                if len(full) > 3900:
+                    mid = full.rfind("\n", 0, 3900)
+                    self._reply(chat_id, full[:mid])
+                    self._reply(chat_id, full[mid:])
+                else:
+                    self._reply(chat_id, full)
             except Exception as e:
-                self._reply(chat_id, f"⚠️ Could not read config: {str(e)[:80]}")
+                self._reply(chat_id, f"⚠️ Could not read config: {str(e)[:120]}")
             return
 
         # ── Update a single field ─────────────────────────────────────────────
@@ -1337,6 +1563,7 @@ class CommandHandler:
             {"command": "mode",    "description": "Switch trade mode (Con/Mod/Agr/V-Agr)"},
             {"command": "mode_info", "description": "Show risk/config for each mode"},
             {"command": "eod",       "description": "Trigger AI Session Retrospective"},
+            {"command": "planning",  "description": "Show entry/SL/TP planning + win-rate estimate"},
         ]
         try:
             r = self.client.post(url, json={"commands": commands})

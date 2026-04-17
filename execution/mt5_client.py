@@ -375,16 +375,14 @@ class MT5Client:
         ]
 
     def get_daily_realized_pnl(self) -> float:
-        """Sums specialized realized profit, commission, and swap of all trades closed since the start of today."""
+        """Sums realized profit, commission, and swap of all trades closed since midnight UTC today."""
         if not MT5_AVAILABLE:
             return 0.0
-            
-        # Get start of CURRENT day in local time (WIB context if running on local windows)
-        now = datetime.now()
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        # history_deals_get uses datetime objects
-        deals = mt5.history_deals_get(start, now)
+
+        now_utc = datetime.now(timezone.utc)
+        start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        # MT5 API expects naive datetimes interpreted as UTC
+        deals = mt5.history_deals_get(start_utc.replace(tzinfo=None), now_utc.replace(tzinfo=None))
         if deals is None:
             return 0.0
             
@@ -443,15 +441,13 @@ class MT5Client:
     def get_daily_deals_today(self) -> list:
         """
         Returns all closed deals from today (since 00:00 UTC).
-        Replaces direct `import MetaTrader5 as mt5_api` usage in main.py.
         Returns list of raw MT5 deal objects, or [] on Linux/simulation.
         """
         if not MT5_AVAILABLE:
             return []
-        from datetime import datetime
-        now   = datetime.now()
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        deals = mt5.history_deals_get(start, now)
+        now_utc = datetime.now(timezone.utc)
+        start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        deals = mt5.history_deals_get(start_utc.replace(tzinfo=None), now_utc.replace(tzinfo=None))
         return list(deals) if deals else []
 
     def get_raw_positions(self, symbol: str | None = None) -> list:

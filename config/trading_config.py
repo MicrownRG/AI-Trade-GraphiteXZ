@@ -123,6 +123,7 @@ class TradingConfig:
             # Profit-lock: small lock early, then loose trail → swing-panjang profit besar
             "micro_profit_lock_r":       0.30,
             "micro_lock_buffer_pips":    2.0,
+            "sl_plus_delay_sec":         0,
             "partial_close_fraction":    0.30,   # only close 30% at TP1, let 70% run
             "news_aligned_tp_mult":      1.80,
             "quick_harvest_on_adverse_news": True,
@@ -139,6 +140,7 @@ class TradingConfig:
             "max_daily_trades":     10,
             "micro_profit_lock_r":       0.25,
             "micro_lock_buffer_pips":    1.5,
+            "sl_plus_delay_sec":         0,
             "partial_close_fraction":    0.35,
             "news_aligned_tp_mult":      1.60,
             "quick_harvest_on_adverse_news": True,
@@ -150,50 +152,57 @@ class TradingConfig:
             "recovery_multiplier":  1.5,
             "partial_close":        True,
             "auto_be":              True,
-            "be_threshold_r":       0.8,      # activate BE earlier (0.8R) to lock profit faster
-            "trailing_pips":        25.0,     # tighter trail — small TF entries
-            "pulse_scalping":       True,     # enabled — frequent M1 entries in calm sessions
-            "max_daily_trades":     0,        # 0 = unlimited
-            "micro_profit_lock_r":       0.20,
-            "micro_lock_buffer_pips":    1.0,
+            "be_threshold_r":       0.5,      # fast BE at 0.5R — lock profit early
+            "trailing_pips":        18.0,     # tighter trail — catch profit on M5 moves
+            "pulse_scalping":       True,
+            "pulse_compound":       True,     # compound enabled — equity growth
+            "max_daily_trades":     0,
+            "micro_profit_lock_r":       0.12,  # micro-lock at 12% of risk (≈3 pips)
+            "micro_lock_buffer_pips":    5.0,   # 0.50 pts — covers spread
+            "sl_plus_delay_sec":         90,    # wait 90s before SL+ to avoid premature lock
             "partial_close_fraction":    0.50,
             "news_aligned_tp_mult":      1.40,
             "quick_harvest_on_adverse_news": True,
+            "momentum_fade_exit":        True,  # close when profit fades from peak
         },
         TradeMode.VERY_AGGRESSIVE: {
-            "risk_per_trade":       0.025,   # 2.5% — 2 losses before 5% hard cutloss
-            "min_score_threshold":  4,        # low threshold — active scanning
+            "risk_per_trade":       0.025,   # 2.5%
+            "min_score_threshold":  4,
             "use_recovery":         True,
             "recovery_multiplier":  1.5,
             "partial_close":        True,
             "auto_be":              True,
-            "be_threshold_r":       0.7,      # very early BE — protect profits on fast M1 moves
-            "trailing_pips":        20.0,     # tight trail matching M1/M5 structure
-            "pulse_scalping":       True,     # always active (blocked automatically in US/Overlap)
-            "pulse_compound":       False,
-            "max_daily_trades":     0,        # unlimited
-            "micro_profit_lock_r":       0.15,
-            "micro_lock_buffer_pips":    0.8,
+            "be_threshold_r":       0.4,      # very early BE — 100% WR target
+            "trailing_pips":        12.0,     # tight trail on M1/M5
+            "pulse_scalping":       True,
+            "pulse_compound":       True,     # compound enabled — equity growth
+            "max_daily_trades":     0,
+            "micro_profit_lock_r":       0.08,  # lock at 8% of risk (≈2 pips) → near-instant
+            "micro_lock_buffer_pips":    5.0,   # 0.50 pts — covers spread
+            "sl_plus_delay_sec":         60,    # wait 60s before SL+ to avoid premature lock
             "partial_close_fraction":    0.60,
             "news_aligned_tp_mult":      1.30,
             "quick_harvest_on_adverse_news": True,
+            "momentum_fade_exit":        True,
         },
         TradeMode.ULTRA_SCALPER: {
-            "risk_per_trade":       0.05,    # 5.0% — 1 loss before cutloss; compound handles growth
+            "risk_per_trade":       0.05,    # 5.0%
             "min_score_threshold":  3,
-            "use_recovery":         False,   # no martingale — uses 3x equity guard instead
-            "partial_close":        False,
-            "auto_be":              False,
-            "be_threshold_r":       0.5,      # ultra-fast protection at half-R
-            "trailing_pips":        15.0,     # very tight trail for M1 scalping
-            "pulse_scalping":       True,     # always active
-            "pulse_compound":       True,     # granular lot compounding enabled
+            "use_recovery":         False,
+            "partial_close":        True,     # partial close enabled — lock profit fast
+            "auto_be":              True,     # auto BE enabled
+            "be_threshold_r":       0.3,      # ultra-fast at 0.3R
+            "trailing_pips":        8.0,      # very tight — M1 scalping
+            "pulse_scalping":       True,
+            "pulse_compound":       True,     # compound enabled
             "max_daily_trades":     0,
-            "micro_profit_lock_r":       0.10,
-            "micro_lock_buffer_pips":    0.5,
-            "partial_close_fraction":    0.70,   # aggressive harvest (partial_close flag is False so unused unless flipped)
+            "micro_profit_lock_r":       0.05,  # lock at 5% of risk (≈1-2 pips)
+            "micro_lock_buffer_pips":    5.0,   # 0.50 pts — covers spread
+            "sl_plus_delay_sec":         45,    # wait 45s before SL+ — ultra needs speed but not instant
+            "partial_close_fraction":    0.70,
             "news_aligned_tp_mult":      1.20,
             "quick_harvest_on_adverse_news": True,
+            "momentum_fade_exit":        True,
         },
     })
 

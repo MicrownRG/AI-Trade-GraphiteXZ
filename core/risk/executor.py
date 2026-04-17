@@ -72,10 +72,16 @@ class RiskExecutor:
         pf           = self.portfolio
         session_name = get_session_name(current_time)
 
-        # ── Margin protection (session-aware) ─────────────────────────────────
-        # Stricter margin requirement during volatile sessions (NY / London)
-        # to avoid forced liquidation during spike moves.
-        min_margin = 1000.0 if session_name in ("NY", "LONDON") else 500.0
+        # ── Margin protection (session & equity aware) ────────────────────────
+        # Micro-accounts ($<500) can only run 0.01 lots — natural margin is low.
+        # Relax requirement so micro-accounts aren't fully blocked.
+        is_micro = pf.balance < 500
+        if is_micro:
+            min_margin = 150.0
+        elif session_name in ("NY", "LONDON"):
+            min_margin = 1000.0
+        else:
+            min_margin = 500.0
         if margin_level < min_margin:
             return self._reject(
                 signal,
@@ -167,8 +173,26 @@ class RiskExecutor:
                 current_atr        = atr_m1,
                 avg_atr            = atr_avg,
                 strategy           = signal.signal_id,
-                session_name       = session_name,   # No.31 volatile session reduction
+                session_name       = session_name,
             )
+
+            # ── Compound scaling for AGG+ modes ──────────────────────────────
+            # When pulse_compound is enabled AND this is NOT a Pulse signal,
+            # scale lot_size based on equity growth above $300 baseline.
+            # compound_factor = min(2.0, 1 + (equity - 300) / 1000)
+            # This means $1300 → 2× lot, $800 → 1.5×, etc.
+            settings_c = TRADING_CONFIG.mode_settings.get(TRADING_CONFIG.current_mode, {})
+            if settings_c.get("pulse_compound", False):
+                _eq = max(safe_balance, 300)
+                _cf = min(2.0, 1.0 + (_eq - 300) / 1000)
+                if _cf > 1.01:
+                    old_lot = lot_size
+                    lot_size = round(lot_size * _cf, 2)
+                    lot_size = max(RISK_CONFIG.min_lot_size, lot_size)
+                    logger.info(
+                        f"📈 Compound scaling: equity={_eq:.0f} factor={_cf:.2f} "
+                        f"lot {old_lot:.2f} -> {lot_size:.2f}"
+                    )
 
         # ── Cumulative lot cap check (equity-aware) ───────────────────────────
         safe_balance = min(pf.balance, pf.equity) if pf.equity > 0 else pf.balance
@@ -248,10 +272,11 @@ class RiskExecutor:
                     signal,
                     f"Max Pulse positions (2) reached ({pulse_count} active)"
                 )
-            if margin_level < 300.0:
+            _pulse_margin_min = 150.0 if is_micro else 300.0
+            if margin_level < _pulse_margin_min:
                 return self._reject(
                     signal,
-                    f"Pulse rejected: margin {margin_level:.1f}% < 300% required"
+                    f"Pulse rejected: margin {margin_level:.1f}% < {_pulse_margin_min:.0f}% required"
                 )
         else:
             if same_direction_count >= max_pos:
